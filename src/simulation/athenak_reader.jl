@@ -10,6 +10,7 @@ below the ray step-quadrature error. HDF5.jl reverses C-ordered axes: on-disk
 
 # Primitive axis order == VariableNames == concat([uov; B]); pins the slicing below.
 const _PRIM_NAMES = ("dens", "velx", "vely", "velz", "eint", "bcc1", "bcc2", "bcc3")
+const _PRIM_NAMES2 = ("rho", "press", "vel1", "vel2", "vel3", "Bcc1", "Bcc2", "Bcc3")
 
 # ------------------------------------------------------------ O(1) leaf-block locate
 #
@@ -137,9 +138,21 @@ AthenaKSnapshot(data, ext_lo, ext_hi, x_left, dx, levels, logical_locations,
                     variable_names, ni, nj, nk, nmb, LeafCache())
 
 function AthenaKSnapshot(filename::AbstractString)
+    using_athenaK = true
     uov, B, x1v, x2v, x3v, x1f, x2f, x3f, levels, loclocs, varnames =
         h5open(filename, "r") do h
-            (read(h["uov"]), read(h["B"]),
+            if haskey(h, "prim")
+                using_athenaK = false
+                prim = read(h["prim"])                   # [rho, press, vel1, vel2, vel3]
+                prim = prim[:, :, :, :, [1, 3, 4, 5, 2]] # [rho, vel1, vel2, vel3, press]
+                press = prim[:, :, :, :, 5]              # pressure
+                gamma = 1.333333                         # adiabatic index (4/3)
+                eint = press / (gamma - 1.0)             # internal energy density
+                prim[:, :, :, :, 5] = eint
+            else
+                prim = read(h["uov"])
+            end
+            (prim, read(h["B"]),
              read(h["x1v"]), read(h["x2v"]), read(h["x3v"]),
              read(h["x1f"]), read(h["x2f"]), read(h["x3f"]),
              read(h["Levels"]), read(h["LogicalLocations"]),
@@ -150,8 +163,14 @@ function AthenaKSnapshot(filename::AbstractString)
     ni, nj, nk, nmb, _ = size(data)
 
     names = String.(varnames)
-    Tuple(names) == _PRIM_NAMES ||
-        error("unexpected AthenaK primitive order $names (expected $(collect(_PRIM_NAMES)))")
+    if using_athenaK
+        Tuple(names) == _PRIM_NAMES ||
+            error("unexpected AthenaK primitive order $names (expected $(collect(_PRIM_NAMES)))")
+    else
+        Tuple(names) == _PRIM_NAMES2 ||
+            error("unexpected AthenaK primitive order $names (expected $(collect(_PRIM_NAMES2)))")
+        names = collect(_PRIM_NAMES)  # remap to AthenaK order
+    end
 
     ext_lo = [SVector(x1f[1, m],   x2f[1, m],   x3f[1, m])   for m in 1:nmb]
     ext_hi = [SVector(x1f[end, m], x2f[end, m], x3f[end, m]) for m in 1:nmb]
