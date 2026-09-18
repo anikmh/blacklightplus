@@ -96,19 +96,14 @@ function (orbit::BinaryOrbit)(t::Real)
     # Convert to Julia's one-based indexing.
     i = i0 + 1
 
-    if i == nt
-        left = nt - 1
-        right = nt
-    else
-        left = i
-        right = i + 1
-    end
+    left = i == nt ? nt - 1 : i
+    right = i == nt ? nt : i + 1
 
     # Athena++ anchors the extrapolation at the last sample
     # when i == nt, and at the left sample otherwise.
     offset = time - orbit.times[i]
 
-    values = SVector{18,Float64}(ntuple(18) do k
+    values = SVector{18,Float64}(ntuple(Val(18)) do k
         slope = (
             orbit.data[k, right] - orbit.data[k, left]
         ) / orbit.dt

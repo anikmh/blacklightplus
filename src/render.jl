@@ -279,3 +279,114 @@ function polunpol_consistency(cfg::RunConfig, snapshot_path::AbstractString)
     end
     return sum(ipol) / sum(iunp)
 end
+
+
+function _pipeline_setup(
+    cfg::RunConfig,
+    snapshot,
+    st::SuperposedBoostedKerrSchildCartesian;
+    t_obs::Real,
+    capture_factor::Float64,
+    C::Float64=80.0,
+    nmax::Int=cfg.max_steps,
+    max_step::Float64=Inf,
+    max_coord_step::Float64=1.0,
+    emission_half_width::Float64=Inf,
+)
+    emission_half_width > 0.0 ||
+        throw(ArgumentError("emission_half_width must be positive"))
+
+    cam = PlaneParallelCamera(
+        cfg.camera.inclination_deg,
+        cfg.camera.distance,
+        cfg.camera.fov,
+        cfg.camera.resolution,
+    )
+
+    rays = camera_rays(st, cam; t_obs=t_obs)
+    states, dls = trace_rays_sampled(
+        st, rays;
+        C=C,
+        nmax=nmax,
+        escape=1.1 * cfg.camera.distance,
+        capture_factor=capture_factor,
+        max_step=max_step,
+        max_coord_step=max_coord_step,
+    )
+
+    snap = snapshot isa AthenaKSnapshot ?
+        snapshot : _load_athenak(snapshot, cfg.plasma.gamma)
+
+    u = units(cfg.m_bh_cgs, cfg.mass_scale_cgs)
+    γ = cfg.plasma.gamma
+
+    sampler = x -> begin
+        if maximum(abs, SVector(x[2], x[3], x[4])) > emission_half_width
+            z3 = zero(SVector{3,Float64})
+            return (rho=0.0, pgas=0.0, uu=z3, bb=z3, inside=false)
+        end
+
+        s = sample_primitives(snap, x)
+        return (
+            rho=s.rho,
+            pgas=pgas_from_eint(s.eint, γ),
+            uu=s.uu,
+            bb=s.bb,
+            inside=s.inside,
+        )
+    end
+
+    return (
+        st=st, cam=cam, rays=rays, states=states,
+        dls=dls, u=u, sampler=sampler,
+    )
+end
+
+
+function render(
+    cfg::RunConfig,
+    snapshot,
+    st::SuperposedBoostedKerrSchildCartesian;
+    t_obs::Real,
+    capture_factor::Float64,
+    polarized::Bool=cfg.polarized,
+    C::Float64=80.0,
+    nmax::Int=cfg.max_steps,
+    max_step::Float64=Inf,
+    max_coord_step::Float64=1.0,
+    emission_half_width::Float64=Inf,
+)
+    cfg.tracer === :numerical ||
+        throw(ArgumentError("the binary metric requires tracer=:numerical"))
+    polarized &&
+        throw(ArgumentError(
+            "binary polarized rendering requires a transport-convention update",
+        ))
+
+    setup = _pipeline_setup(
+        cfg, snapshot, st;
+        t_obs=t_obs,
+        capture_factor=capture_factor,
+        C=C,
+        nmax=nmax,
+        max_step=max_step,
+        max_coord_step=max_coord_step,
+        emission_half_width=emission_half_width,
+    )
+    (; cam, rays, states, dls, u, sampler) = setup
+    scc = _prepared_scc(cfg, u)
+
+    n = length(rays)
+    ν = cfg.frequency_hz
+    Lu = u.L_unit
+    intensities = Vector{Float64}(undef, n)
+
+    Threads.@threads for i in 1:n
+        intensities[i] = unpolarized_march(
+            st, scc, sampler, states[i], dls[i], ν, Lu,
+        )
+    end
+
+    I = reshape(intensities, cam.npix, cam.npix)
+    return (I=I, Q=zero(I), U=zero(I), V=zero(I))
+end

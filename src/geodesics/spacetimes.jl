@@ -446,3 +446,230 @@ function inverse_metric_gradient(
 
     return SArray{Tuple{4,4,4},Float64,3,64}(dginv)
 end
+
+
+@inline function _sbks_trace_geometry(
+    st::SuperposedBoostedKerrSchildCartesian,
+    x::SVector{4,Float64},
+    capture_factor::Float64,
+)
+    position = SVector(x[2], x[3], x[4])
+    orb = st.orbit(x[1])
+
+    dmin = Inf
+    captured = false
+    for A in 1:2
+        mass = A == 1 ? 1.0 : st.q
+        spin = orb.spin[A]
+        velocity = orb.velocity[A]
+
+        v2 = dot(velocity, velocity)
+        a2 = dot(spin, spin)
+
+        if !(all(isfinite, orb.center[A]) &&
+             0.0 <= v2 < 1.0 &&
+             0.0 <= a2 <= mass * mass)
+            return (valid=false, captured=false, dmin=NaN, R=NaN)
+        end
+
+        # Match the position adjustments used by the metric.
+        X, _, _ = _sbks_rest_position(
+            position, orb.center[A], velocity, spin,
+        )
+        X, _ = _sbks_adjust_position(X, spin)
+        r, _, _ = _sbks_radius_angles(X, spin)
+
+        if !isfinite(r)
+            return (valid=false, captured=false, dmin=NaN, R=NaN)
+        end
+
+        rh = mass + sqrt(mass * mass - a2)
+        captured |= r <= capture_factor * rh + HORIZON_EPS_SAMPLED
+
+        # Step control remains independent of the capture enlargement.
+        dmin = min(dmin, r - rh)
+    end
+
+    R = norm(position)
+    return (valid=isfinite(R), captured=captured, dmin=dmin, R=R)
+end
+
+
+function trace_rays_sampled(
+    st::SuperposedBoostedKerrSchildCartesian,
+    rays::Vector{SVector{8,Float64}};
+    capture_factor::Float64,
+    C::Float64=80.0,
+    escape::Float64=ESCAPE_RADIUS,
+    nmax::Int=20000,
+    R_em::Float64=Inf,
+    max_step::Float64=Inf,
+    max_coord_step::Float64=1.0,
+    cell_size_fn=nothing,
+    cell_frac::Float64=1.0,
+    return_status::Bool=false,
+)
+    isfinite(C) && C > 0.0 ||
+        throw(ArgumentError("C must be finite and positive"))
+    isfinite(capture_factor) && capture_factor >= 1.0 ||
+        throw(ArgumentError("capture_factor must be finite and at least 1"))
+    nmax > 0 || throw(ArgumentError("nmax must be positive"))
+    escape > 0.0 || throw(ArgumentError("escape must be positive"))
+    R_em > 0.0 || throw(ArgumentError("R_em must be positive"))
+    max_step > 0.0 || throw(ArgumentError("max_step must be positive"))
+    max_coord_step > 0.0 ||
+        throw(ArgumentError("max_coord_step must be positive"))
+    isfinite(cell_frac) && cell_frac > 0.0 ||
+        throw(ArgumentError("cell_frac must be finite and positive"))
+    isfinite(st.q) && st.q > 0.0 ||
+        throw(ArgumentError("binary mass ratio must be finite and positive"))
+
+    n = length(rays)
+    states = Vector{Vector{SVector{8,Float64}}}(undef, n)
+    dls = Vector{Vector{Float64}}(undef, n)
+    status = fill(:unfinished, n)
+
+    Threads.@threads for i in 1:n
+        ys = SVector{8,Float64}[rays[i]]
+        hs = Float64[]
+        sizehint!(ys, 1024)
+        sizehint!(hs, 1024)
+        y = rays[i]
+        r_prev = Inf
+
+        # Check termination after the final permitted step as well.
+        for step in 0:nmax
+            all(isfinite, y) || error("ray $i: nonfinite state")
+
+            x = SVector(y[1], y[2], y[3], y[4])
+            ctl = _sbks_trace_geometry(st, x, capture_factor)
+            ctl.valid ||
+                error("ray $i: invalid binary geometry at t=$(x[1])")
+
+            if ctl.captured
+                status[i] = :captured
+                break
+            end
+
+            R = ctl.R
+            if R > r_prev
+                if R > escape
+                    status[i] = :escaped
+                    break
+                elseif R > R_em
+                    status[i] = :emission_exit
+                    break
+                end
+            end
+            r_prev = R
+
+            step == nmax &&
+                error("ray $i: reached nmax=$nmax at state $(Tuple(y))")
+
+            rhs = geodesic_rhs(st, y)
+            all(isfinite, rhs) ||
+                error("ray $i: nonfinite geodesic derivative")
+            rhs[1] > 0.0 ||
+                error("ray $i: photon does not have positive dt/dlambda")
+
+            spatial_rate = norm(SVector(rhs[2], rhs[3], rhs[4]))
+            rate = max(abs(rhs[1]), spatial_rate)
+            h = min(min(ctl.dmin / C, max_coord_step) / rate, max_step)
+
+            if cell_size_fn !== nothing
+                cell_size = cell_size_fn(x)
+                cell_size > 0.0 ||
+                    error("ray $i: cell_size_fn must return a positive size")
+                if spatial_rate > 0.0
+                    h = min(h, cell_frac * cell_size / spatial_rate)
+                end
+            end
+
+            isfinite(h) && h > 0.0 ||
+                error("ray $i: invalid affine step $h")
+
+            ynew = rk4_step_fixed(st, y, -h)
+            all(isfinite, ynew) ||
+                error("ray $i: nonfinite RK4 result")
+            ynew[1] < y[1] ||
+                error("ray $i: RK4 step did not decrease coordinate time")
+
+            y = ynew
+            push!(ys, y)
+            push!(hs, h)
+        end
+
+        m = length(ys)
+        rev = Vector{SVector{8,Float64}}(undef, m)
+        dl = Vector{Float64}(undef, m)
+        for k in 1:m
+            rev[k] = ys[m+1-k]
+        end
+        for k in 1:m-1
+            dl[k] = hs[m-k]
+        end
+        dl[m] = 0.0
+        states[i] = rev
+        dls[i] = dl
+    end
+
+    return return_status ? (states, dls, status) : (states, dls)
+end
+
+# Binary camera methods
+
+function camera_rays(
+    st::SuperposedBoostedKerrSchildCartesian,
+    cam::PlaneParallelCamera;
+    t_obs::Real,
+)
+    edges = range(-cam.fov / 2, cam.fov / 2; length=cam.npix + 1)
+    centres = (edges[1:end-1] .+ edges[2:end]) ./ 2
+    coords = [(α, β) for α in centres for β in centres]
+    return camera_rays_at(st, cam, coords; t_obs=t_obs)
+end
+
+
+function camera_rays_at(
+    st::SuperposedBoostedKerrSchildCartesian,
+    cam::PlaneParallelCamera,
+    coords::Vector{Tuple{Float64,Float64}};
+    t_obs::Real,
+)
+    time = Float64(t_obs)
+    isfinite(time) || throw(ArgumentError("t_obs must be finite"))
+
+    i = deg2rad(cam.inc_deg)
+    outward = SVector(0.0, sin(i), 0.0, cos(i))
+    rays = Vector{SVector{8,Float64}}(undef, length(coords))
+
+    for (idx, (α, β)) in enumerate(coords)
+        x = _image_to_bh(α, β, cam.inc_deg, cam.d)
+        x = setindex(x, time, 1)
+
+        gcov = metric(st, x)
+        gcon = inverse_metric(st, x)
+
+        all(isfinite, gcov) && all(isfinite, gcon) ||
+            error("camera ray $idx: nonfinite metric")
+        gcon[1, 1] < 0.0 ||
+            error("camera ray $idx: Eulerian observer requires gcon[1,1] < 0")
+
+        # Eulerian observer four-velocity.
+        lapse = inv(sqrt(-gcon[1, 1]))
+        u = -lapse * gcon[:, 1]
+
+        # Spatial direction represented as a four-vector orthogonal to u.
+        n = outward + dot(u, gcov * outward) * u
+        n2 = dot(n, gcov * n)
+        isfinite(n2) && n2 > 0.0 ||
+            error("camera ray $idx: invalid projected direction")
+        n = n / sqrt(n2)
+
+        # Future-directed null momentum, normalized to -p_mu u^mu = 1.
+        p = gcov * (u + n)
+        rays[idx] = vcat(x, p)
+    end
+
+    return rays
+end
