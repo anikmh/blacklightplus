@@ -13,11 +13,12 @@ using ForwardDiff: Dual, partials, value
 using KernelAbstractions
 using CUDA
 using Adapt
-using LinearAlgebra: dot
+using LinearAlgebra: dot, norm
 using BlackLightPlus: SuperposedKerrSchild, PlaneParallelCamera, camera_rays
 using BlackLightPlus.Geodesics: metric, inverse_metric, geodesic_rhs, rk4_step_fixed,
       ks_radius_hole, horizon_radius_hole, HORIZON_EPS_SAMPLED, ADMGridSpacetime,
       StationarySpacetime, _adm_gcov
+using BlackLightPlus.Geodesics: BinaryOrbit, SuperposedBoostedKerrSchildCartesian
 using BlackLightPlus.Simulation: AthenaKSnapshot
 
 isdefined(@__MODULE__, :_gimg_coeffs) || Base.include(@__MODULE__, joinpath(@__DIR__, "gpu_image.jl"))
@@ -592,4 +593,274 @@ function trace_shadow_gpu(st, rays::Vector{SVector{8,Float64}};
     end
     return ([m[1] for m in ms], [m[2] for m in ms], [m[3] for m in ms],
             [m[4] for m in ms], ys)
+end
+
+# ---------------------------------------------------------------- device binary orbit
+
+struct DevBinaryOrbit{T,D}
+    q::Float64
+    times::T
+    data::D
+    dt::Float64
+end
+
+Adapt.@adapt_structure DevBinaryOrbit
+
+@inline function (orbit::DevBinaryOrbit)(t::Real)
+    time = Float64(t)
+    nt = length(orbit.times)
+
+    i0 = trunc(Int, (time - orbit.times[1]) / orbit.dt + 1000) - 1000
+    i0 = clamp(i0, 0, nt - 1)
+    i = i0 + 1
+
+    left = i == nt ? nt - 1 : i
+    right = i == nt ? nt : i + 1
+    offset = time - orbit.times[i]
+
+    values = SVector{18,Float64}(ntuple(Val(18)) do k
+        slope = (
+            orbit.data[k, right] - orbit.data[k, left]
+        ) / orbit.dt
+
+        offset * slope + orbit.data[k, i]
+    end)
+
+    return (
+        center = (
+            SVector(values[1], values[2], values[3]),
+            SVector(values[4], values[5], values[6]),
+        ),
+        velocity = (
+            SVector(values[13], values[14], values[15]),
+            SVector(values[16], values[17], values[18]),
+        ),
+        spin = (
+            SVector(values[7], values[8], values[9]),
+            SVector(values[10], values[11], values[12]),
+        ),
+    )
+end
+
+function Adapt.adapt_structure(
+    to, st::SuperposedBoostedKerrSchildCartesian,
+)
+    return SuperposedBoostedKerrSchildCartesian(
+        st.q, Adapt.adapt(to, st.orbit),
+    )
+end
+
+# ---------------------------------------------------------------- binary image kernel
+
+function _sbks_image_kernel!(
+    image, statuses, steps, rays, st,
+    blk, xlft, dxb, lo, hi,
+    ni, nj, nk, nmb, gp,
+    C, escape, nmax, capture_factor, emission_half_width,
+)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+
+    if idx <= length(rays)
+        G = BlackLightPlus.Geodesics
+        y = rays[idx]
+        r_prev = Inf
+        Iinv = 0.0
+        trans = 1.0
+        count = 0
+        status = 3
+
+        for step in 0:nmax
+            if !all(isfinite, y)
+                status = 4
+                break
+            end
+
+            x = SVector(y[1], y[2], y[3], y[4])
+            ctl = G._sbks_trace_geometry(st, x, capture_factor)
+
+            if !ctl.valid
+                status = 4
+                break
+            elseif ctl.captured
+                status = 1
+                break
+            elseif ctl.R > escape && ctl.R > r_prev
+                status = 2
+                break
+            end
+
+            r_prev = ctl.R
+            step == nmax && break
+
+            rhs = G.geodesic_rhs(st, y)
+            if !all(isfinite, rhs) || rhs[1] <= 0.0
+                status = 4
+                break
+            end
+
+            spatial_rate = norm(SVector(rhs[2], rhs[3], rhs[4]))
+            rate = max(abs(rhs[1]), spatial_rate)
+            h = min(ctl.dmin / C, 1.0) / rate
+
+            if !isfinite(h) || h <= 0.0
+                status = 4
+                break
+            end
+
+            ynew = G.rk4_step_fixed(st, y, -h)
+            if !all(isfinite, ynew) || ynew[1] >= y[1]
+                status = 4
+                break
+            end
+
+            # Camera-side coefficients over a positive affine interval.
+            if maximum(abs, SVector(x[2], x[3], x[4])) <= emission_half_width
+                prim = _gamr_sample_scan(
+                    blk, xlft, dxb, lo, hi,
+                    ni, nj, nk, nmb, x[2], x[3], x[4],
+                )
+
+                if prim[1] > 0.0 && prim[5] > 0.0 &&
+                   !(prim[6] == 0.0 && prim[7] == 0.0 && prim[8] == 0.0)
+
+                    kcov = SVector(y[5], y[6], y[7], y[8])
+                    gcov = G.metric(st, x)
+                    gcon = G.inverse_metric(st, x)
+
+                    j_inv, a_inv = _gimg_coeffs_st(
+                        prim, kcov, gcov, gcon, gp,
+                    )
+
+                    if !(isfinite(j_inv) && isfinite(a_inv))
+                        status = 4
+                        break
+                    end
+
+                    ds = h * gp.L_unit / gp.nu_obs
+                    A, B = _gimg_ab(j_inv, a_inv, ds)
+                    Iinv += trans * B
+                    trans *= A
+
+                    if !(isfinite(Iinv) && isfinite(trans))
+                        status = 4
+                        break
+                    end
+                end
+            end
+
+            y = ynew
+            count += 1
+        end
+
+        image[idx] = (status == 1 || status == 2) ?
+            Iinv * gp.nu_obs^3 : NaN
+        statuses[idx] = status
+        steps[idx] = count
+    end
+
+    return nothing
+end
+
+# ---------------------------------------------------------------- binary host renderer
+
+function render_gpu_spacetime(
+    cfg,
+    st::SuperposedBoostedKerrSchildCartesian,
+    snap_or_scangrid;
+    t_obs::Real,
+    capture_factor::Float64,
+    polarized::Bool=false,
+    C::Float64=80.0,
+    nmax::Int=cfg.max_steps,
+    emission_half_width::Float64=Inf,
+    device::Integer=CUDA.deviceid(CUDA.device()),
+    return_status::Bool=false,
+)
+    cfg.tracer === :numerical ||
+        throw(ArgumentError("the binary metric requires tracer=:numerical"))
+    polarized &&
+        throw(ArgumentError("binary polarized GPU rendering is not implemented"))
+    st.orbit isa BinaryOrbit ||
+        throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
+    isfinite(st.q) && st.q > 0.0 ||
+        throw(ArgumentError("binary mass ratio must be finite and positive"))
+    isfinite(C) && C > 0.0 ||
+        throw(ArgumentError("C must be finite and positive"))
+    isfinite(capture_factor) && capture_factor >= 1.0 ||
+        throw(ArgumentError("capture_factor must be finite and at least 1"))
+    0 < nmax <= typemax(Int32) ||
+        throw(ArgumentError("nmax must fit in a positive Int32"))
+    emission_half_width > 0.0 ||
+        throw(ArgumentError("emission_half_width must be positive"))
+    cfg.camera.resolution > 0 ||
+        throw(ArgumentError("camera resolution must be positive"))
+    isfinite(cfg.camera.distance) && cfg.camera.distance > 0.0 ||
+        throw(ArgumentError("camera distance must be finite and positive"))
+
+    cam = PlaneParallelCamera(
+        cfg.camera.inclination_deg,
+        cfg.camera.distance,
+        cfg.camera.fov,
+        cfg.camera.resolution,
+    )
+    rays = camera_rays(st, cam; t_obs=t_obs)
+
+    dev = Int(device)
+    CUDA.device!(dev)
+
+    if snap_or_scangrid isa DeviceAMRScanGrid
+        sg = snap_or_scangrid
+        for arrays in (
+            sg.dev_blk, sg.dev_xlft, sg.dev_dxb, sg.dev_lo, sg.dev_hi,
+        )
+            haskey(arrays, dev) ||
+                throw(ArgumentError("fluid grid is not uploaded to device $dev"))
+        end
+    elseif snap_or_scangrid isa AthenaKSnapshot
+        sg = upload_amr_scan(snap_or_scangrid, [dev])
+    else
+        throw(ArgumentError("pass an AthenaKSnapshot or DeviceAMRScanGrid"))
+    end
+
+    orb = st.orbit
+    orb_gpu = DevBinaryOrbit(
+        orb.q, CuArray(orb.times), CuArray(orb.data), orb.dt,
+    )
+    st_gpu = SuperposedBoostedKerrSchildCartesian(st.q, orb_gpu)
+
+    nrays = length(rays)
+    rays_gpu = CuArray(rays)
+    image_gpu = CUDA.zeros(Float64, nrays)
+    status_gpu = CUDA.zeros(Int32, nrays)
+    steps_gpu = CUDA.zeros(Int32, nrays)
+
+    gp = _gimg_params(cfg)
+    escape = 1.1 * cam.d
+
+    @cuda threads=32 blocks=cld(nrays, 32) _sbks_image_kernel!(
+        image_gpu, status_gpu, steps_gpu, rays_gpu, st_gpu,
+        sg.dev_blk[dev],
+        sg.dev_xlft[dev],
+        sg.dev_dxb[dev],
+        sg.dev_lo[dev],
+        sg.dev_hi[dev],
+        sg.ni, sg.nj, sg.nk, sg.nmb,
+        gp, C, escape, nmax, capture_factor, emission_half_width,
+    )
+    CUDA.synchronize()
+
+    I = reshape(Array(image_gpu), cam.npix, cam.npix)
+    status = reshape(Array(status_gpu), cam.npix, cam.npix)
+    steps = reshape(Array(steps_gpu), cam.npix, cam.npix)
+
+    if return_status
+        return (I=I, status=status, steps=steps)
+    end
+
+    failed = count(s -> s != 1 && s != 2, status)
+    failed == 0 ||
+        error("$failed GPU rays failed; use return_status=true for diagnostics")
+    all(isfinite, I) || error("GPU image contains nonfinite intensities")
+
+    return I
 end
