@@ -20,7 +20,7 @@ holes with spins along ±z,
 
 exact for one BH, the standard large-separation binary initial-data ansatz for
 two. The single-KS inverse shortcut is invalid for the sum (cross term
-f_A f_B l^A·l^B), so `inverse_metric` uses the full 4×4 inverse (StaticArrays)
+f_A f_B l^A·l^B), so `inverse_metric` uses the full 4x4 inverse (StaticArrays)
 and `inverse_metric_gradient` differentiates THAT with ForwardDiff — reducing
 exactly to single Kerr when a second mass is zero.
 """
@@ -157,4 +157,292 @@ function trace_rays_sampled(st::SuperposedKerrSchild{N}, rays::Vector{SVector{8,
         dls[i] = dl
     end
     return states, dls
+end
+
+
+"""
+    SuperposedBoostedKerrSchildCartesian(q, orbit)
+
+Time-dependent superposed boosted Kerr-Schild binary metric in Cartesian
+coordinates, following the Athena++ binary-metric implementation.
+
+Uses coordinates x = (t, x, y, z), signature (-,+,+,+), and units
+G = c = M₁ = 1. The BH masses are M₁ = 1 and M₂ = q.
+
+The callable `orbit(t)` must return a named tuple:
+
+    (
+        center   = (c1, c2),
+        velocity = (v1, v2),
+        spin     = (a1, a2),
+    )
+
+Each cA, vA, and aA is an `SVector{3,Float64}`. Positions, velocities,
+and spins are evaluated at simulation coordinate time t.
+
+Spin vectors are a = J/M, where a and J are three-vectors.
+The vector a has dimensions of length; χ = a/M is dimensionless.
+Any secondary-spin mass scaling must already be applied by `orbit(t)`.
+
+The metric is assembled as
+
+    g_{μν} = η_{μν} + f₁ ℓ⁽¹⁾_μ ℓ⁽¹⁾_ν + f₂ ℓ⁽²⁾_μ ℓ⁽²⁾_ν.
+
+Includes Athena++'s small-position adjustment, interior radius
+regularization, and finite-difference derivative prescription.
+"""
+struct SuperposedBoostedKerrSchildCartesian{F} <: AnalyticSpacetime{Float64}
+    q::Float64
+    orbit::F
+end
+
+SuperposedBoostedKerrSchildCartesian(q::Real, orbit) =
+    SuperposedBoostedKerrSchildCartesian{typeof(orbit)}(
+        Float64(q), orbit
+    )
+
+# Numerical prescriptions used in the Athena++ implementation.
+const _SBKS_SMALL = 1.0e-7
+const _SBKS_DELTA = 1.0e-4
+
+
+# 1. Reproduce Athena++'s small-a⋅X position adjustment.
+#
+# The returned D is deliberately assigned ±SMALL in this branch.
+# It is not necessarily exactly dot(a, X) after the adjustment.
+function _sbks_adjust_position(X, a)
+    amag = sqrt(dot(a, a))
+    D = dot(a, X)
+
+    if abs(D) < _SBKS_SMALL
+        target = D >= 0.0 ? _SBKS_SMALL : -_SBKS_SMALL
+        shift = target - D / (amag + _SBKS_SMALL)
+
+        X = X + shift * a / (amag + _SBKS_SMALL)
+        D = target
+    end
+
+    return X, D
+end
+
+
+# 2. Transform the displacement into the instantaneous BH rest frame.
+function _sbks_rest_position(position, center, velocity, spin)
+    d = position - center
+
+    v2 = dot(velocity, velocity)
+    lorentz = inv(sqrt(1.0 - v2))
+    K = lorentz^2 / (lorentz + 1.0)
+
+    X = d + K * dot(velocity, d) * velocity
+
+    # Matches the adjustment in Athena++'s get_prime_coords.
+    X, _ = _sbks_adjust_position(X, spin)
+
+    return X, lorentz, K
+end
+
+
+# 3. Calculate the KS radius and auxiliary angles used by the
+#    interior regularization.
+function _sbks_radius_angles(X, a)
+    amag = sqrt(dot(a, a))
+
+    # Athena++ calculates this cross product before adjusting
+    # the local coordinate copy. Preserve that ordering.
+    a_cross_X = cross(a, X)
+
+    X_adjusted, D = _sbks_adjust_position(X, a)
+
+    R = sqrt(dot(X_adjusted, X_adjusted))
+    difference = R^2 - amag^2
+
+    r = sqrt(
+        difference + sqrt(difference^2 + 4.0 * D^2)
+    ) / sqrt(2.0)
+
+    lspace = (
+        r * X_adjusted - a_cross_X + (D / r) * a
+    ) / (r^2 + amag^2)
+
+    # These angles describe lspace's direction in the fixed axes.
+    # For spin aligned with +z, they give the usual KS angles.
+    theta_aux = acos(clamp(lspace[3], -1.0, 1.0))
+    phi_aux = atan(lspace[2], lspace[1])
+
+    return r, theta_aux, phi_aux
+end
+
+
+# 4. Calculate one BH's covariant metric contribution f * l_mu * l_nu.
+function _sbks_bh_contribution(mass, center, velocity, spin, position)
+    X, lorentz, K =
+        _sbks_rest_position(position, center, velocity, spin)
+
+    # Matches the additional adjustment inside Athena++'s
+    # boosted_BH_metric_addition.
+    X, _ = _sbks_adjust_position(X, spin)
+
+    r, theta_aux, phi_aux = _sbks_radius_angles(X, spin)
+
+    a2 = dot(spin, spin)
+    r_horizon = mass + sqrt(mass^2 - a2)
+
+    # Reproduce Athena++'s interior metric prescription.
+    if r < 0.8 * r_horizon
+        r = 0.8 * r_horizon
+
+        n = SVector(
+            sin(theta_aux) * cos(phi_aux),
+            sin(theta_aux) * sin(phi_aux),
+            cos(theta_aux),
+        )
+
+        X = r * n + cross(spin, n)
+    end
+
+    D = dot(spin, X)
+
+    # Kerr–Schild scalar coefficient.
+    f = 2.0 * mass * r^3 / (r^4 + D^2)
+
+    # Spatial components of the rest-frame covector.
+    # Its temporal component is lprime_0 = 1.
+    lprime = (
+        r * X - cross(spin, X) + (D / r) * spin
+    ) / (r^2 + a2)
+
+    # Transform the covector into simulation coordinates.
+    velocity_dot_l = dot(velocity, lprime)
+
+    l0 = lorentz * (1.0 - velocity_dot_l)
+    lspace = lprime + (K * velocity_dot_l - lorentz) * velocity
+
+    # Four covariant components, ordered (t, x, y, z).
+    l = SVector(l0, lspace[1], lspace[2], lspace[3])
+
+    return f * (l * transpose(l))
+end
+
+
+# 5. Assemble the time-dependent binary metric.
+function metric(
+    st::SuperposedBoostedKerrSchildCartesian,
+    x::SVector{4},
+)
+    t = x[1]
+    position = SVector(x[2], x[3], x[4])
+
+    orb = st.orbit(t)
+
+    h1 = _sbks_bh_contribution(
+        1.0,
+        orb.center[1],
+        orb.velocity[1],
+        orb.spin[1],
+        position,
+    )
+
+    h2 = _sbks_bh_contribution(
+        st.q,
+        orb.center[2],
+        orb.velocity[2],
+        orb.spin[2],
+        position,
+    )
+
+    return ETA + h1 + h2
+end
+
+
+# 6. Invert the combined metric.
+function inverse_metric(
+    st::SuperposedBoostedKerrSchildCartesian,
+    x::SVector{4},
+)
+    return inv(metric(st, x))
+end
+
+
+# 7. Covariant metric derivatives.
+#
+# Return convention:
+#   dg[mu, nu, sigma] = ∂g_{mu nu} / ∂x^sigma
+#
+# Julia indices 1,2,3,4 correspond to coordinates t,x,y,z.
+# Uses Athena++'s forward-difference increment and interior cutoff.
+function metric_gradient(
+    st::SuperposedBoostedKerrSchildCartesian,
+    x::SVector{4,Float64},
+)
+    position = SVector(x[2], x[3], x[4])
+    orb = st.orbit(x[1])
+
+    dg = zeros(MArray{Tuple{4,4,4},Float64,3,64})
+
+    # Athena++ sets every metric derivative to zero in this region.
+    for A in 1:2
+        X, _, _ = _sbks_rest_position(
+            position,
+            orb.center[A],
+            orb.velocity[A],
+            orb.spin[A],
+        )
+
+        R = sqrt(dot(X, X))
+        amag = sqrt(dot(orb.spin[A], orb.spin[A]))
+
+        if R <= amag
+            return SArray{Tuple{4,4,4},Float64,3,64}(dg)
+        end
+    end
+
+    g = metric(st, x)
+
+    for sigma in 1:4
+        shifted = setindex(
+            x,
+            x[sigma] + _SBKS_DELTA,
+            sigma,
+        )
+
+        # Use the actual floating-point increment, as Athena++ does.
+        step = shifted[sigma] - x[sigma]
+
+        gp = metric(st, shifted)
+
+        for nu in 1:4, mu in 1:4
+            dg[mu, nu, sigma] = (gp[mu, nu] - g[mu, nu]) / step
+        end
+    end
+
+    return SArray{Tuple{4,4,4},Float64,3,64}(dg)
+end
+
+
+# 8. Inverse-metric derivatives required by the Hamiltonian integrator.
+#
+# ∂g⁻¹ = -g⁻¹ (∂g) g⁻¹
+function inverse_metric_gradient(
+    st::SuperposedBoostedKerrSchildCartesian,
+    x::SVector{4,Float64},
+)
+    ginv = inverse_metric(st, x)
+    dg = metric_gradient(st, x)
+
+    dginv = zeros(MArray{Tuple{4,4,4},Float64,3,64})
+
+    for sigma in 1:4
+        derivative = SMatrix{4,4,Float64,16}(
+            dg[:, :, sigma]
+        )
+
+        inverse_derivative = -ginv * derivative * ginv
+
+        for nu in 1:4, mu in 1:4
+            dginv[mu, nu, sigma] = inverse_derivative[mu, nu]
+        end
+    end
+
+    return SArray{Tuple{4,4,4},Float64,3,64}(dginv)
 end

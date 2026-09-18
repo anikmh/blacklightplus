@@ -16,6 +16,7 @@ using SciMLBase: ODEProblem, solve, CallbackSet, ContinuousCallback, terminate!
 
 export AbstractSpacetime, AnalyticSpacetime, StationarySpacetime,
        KerrSchildCartesian, Minkowski, UserMetric, SuperposedKerrSchild,
+       BinaryOrbit, SuperposedBoostedKerrSchildCartesian,
        ADMGridSpacetime, adm_grid_from_metric, sample_adm,
        ks_radius_hole, horizon_radius_hole,
        metric, inverse_metric, inverse_metric_gradient,
@@ -38,10 +39,11 @@ export AbstractSpacetime, AnalyticSpacetime, StationarySpacetime,
 include("metrics.jl")
 include("camera.jl")
 include("integrator.jl")
-include("spacetimes.jl")  # after integrator: uses _rhs_ode, geodesic_rhs
-include("numerical_spacetime.jl")  # after integrator: uses ETA, _rhs_ode, geodesic engine
-include("kerr_orbits.jl")  # shared exact-Kerr orbital primitives (before analytic/lensing)
-include("analytic_kerr.jl")  # AART/Krang exact-Kerr elliptic equatorial tracer
-include("lensing_bands.jl")  # AART critical curve + n-band lensing bands (host setup)
+include("binary_orbits.jl")       # binary-BH orbit reader and interpolation
+include("spacetimes.jl")          # after integrator: uses _rhs_ode, geodesic_rhs
+include("numerical_spacetime.jl") # after integrator: uses ETA, _rhs_ode, geodesic engine
+include("kerr_orbits.jl")   # shared exact-Kerr orbital primitives (before analytic/lensing)
+include("analytic_kerr.jl") # AART/Krang exact-Kerr elliptic equatorial tracer
+include("lensing_bands.jl") # AART critical curve + n-band lensing bands (host setup)
 
 end # module

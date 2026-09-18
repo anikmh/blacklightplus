@@ -40,6 +40,7 @@ export CameraConfig, PlasmaConfig, RunConfig
 
 # Geodesics — spacetimes, metric, integration, camera, Kerr orbits, analytic (AART/Krang) tracer
 export KerrSchildCartesian, Minkowski, UserMetric, SuperposedKerrSchild,
+       BinaryOrbit, SuperposedBoostedKerrSchildCartesian,
        ADMGridSpacetime, adm_grid_from_metric, sample_adm,
        ks_radius_hole, horizon_radius_hole,
        metric, inverse_metric, inverse_metric_gradient, ks_radius, horizon_radius,
