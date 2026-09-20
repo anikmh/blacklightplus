@@ -1,15 +1,13 @@
 # Geodesics — binary_orbits.jl
 
 """
-    BinaryOrbit(filename; t0=0.0)
+    BinaryOrbit
 
-Read an Athena++ binary-BH orbit file.
+Tabulated binary-BH orbital data in units G = c = M1 = 1,
+with mass ratio `q = M2/M1`.
 
-The first line contains the number of samples and mass ratio q.
-Each subsequent binary record contains 19 little-endian Float64 values:
-time, followed by 18 orbital quantities.
-
-The orbital quantities are stored in this order:
+Load from a file using `BinaryOrbit(filename; t0=0.0)`.
+The `data` array has shape (18, nt), with rows ordered as:
 
     1:3    BH 1 position
     4:6    BH 2 position
@@ -18,11 +16,11 @@ The orbital quantities are stored in this order:
     13:15  BH 1 velocity
     16:18  BH 2 velocity
 
-Adds t0 to the stored times and multiplies BH 2's spin components
-by q, matching Athena++'s set_orbit_arrays.
+Positions, velocities, and spins are spatial three-vectors.
+Stored spins are `a = J/M` in primary-mass units.
 
-The resulting object is callable: orbit(t) returns interpolated
-positions, velocities, and spin vectors for both BHs.
+Call `orbit(t)` to interpolate both BHs' orbital quantities at
+simulation coordinate time `t`.
 """
 struct BinaryOrbit
     q::Float64
@@ -31,6 +29,17 @@ struct BinaryOrbit
     dt::Float64
 end
 
+"""
+    BinaryOrbit(filename::AbstractString; t0=0.0)
+
+Load an Athena++ orbit file containing a text header followed by
+little-endian `Float64` records.
+
+Add `t0` to the tabulated times and scale the secondary spin by `q`
+to express `a = J/M` in primary-mass units.
+Require at least two samples and positive initial time spacing;
+interpolation assumes uniformly spaced records.
+"""
 function BinaryOrbit(filename::AbstractString; t0::Real=0.0)
     q, records = open(filename, "r") do io
         header = split(readline(io))
@@ -62,28 +71,21 @@ function BinaryOrbit(filename::AbstractString; t0::Real=0.0)
     return BinaryOrbit(q, times, data, dt)
 end
 
-
 """
     (orbit::BinaryOrbit)(t::Real)
 
-Interpolate the orbital quantities at simulation coordinate time t.
+Interpolate orbital data at simulation coordinate time `t`.
 
-Returns
+Return `(center=(c1, c2), velocity=(v1, v2), spin=(a1, a2))`.
+Each entry is a spatial three-vector of type `SVector{3,Float64}`;
+spins are `a = J/M` in primary-mass units.
 
-    (
-        center   = (c1, c2),
-        velocity = (v1, v2),
-        spin     = (a1, a2),
-    )
+Use Athena++'s uniform-spacing interval selection and linear
+interpolation. Outside the tabulated range, extrapolate using
+the first or last segment.
 
-Each cA, vA, and aA is an SVector{3,Float64}.
-
-Uses Athena++'s uniform-spacing interval selection and componentwise
-linear interpolation. Outside the tabulated time range, extrapolates
-using the first or last segment, as Athena++ does.
-
-Velocities are interpolated from their stored values, rather than
-calculated by differentiating the positions.
+Interpolate velocities from stored values rather than differentiating
+the positions.
 """
 function (orbit::BinaryOrbit)(t::Real)
     time = Float64(t)

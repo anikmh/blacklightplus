@@ -596,7 +596,18 @@ function trace_shadow_gpu(st, rays::Vector{SVector{8,Float64}};
 end
 
 # ---------------------------------------------------------------- device binary orbit
+"""
+    DevBinaryOrbit(q, times, data, dt)
 
+Store binary orbital data in arrays that can be adapted for GPU use.
+
+`times` contains coordinate times with uniform spacing `dt`.
+`data` has shape (18, nt), ordered as center1, center2, spin1, spin2,
+velocity1, velocity2, each with three spatial components.
+
+Use data from an already-loaded `BinaryOrbit`, with the time offset
+and secondary-spin scaling already applied.
+"""
 struct DevBinaryOrbit{T,D}
     q::Float64
     times::T
@@ -606,6 +617,16 @@ end
 
 Adapt.@adapt_structure DevBinaryOrbit
 
+"""
+    (orbit::DevBinaryOrbit)(t::Real)
+
+Interpolate orbital data at coordinate time `t`, matching `BinaryOrbit`'s
+linear interpolation and endpoint extrapolation.
+
+Return `(center=(c1, c2), velocity=(v1, v2), spin=(a1, a2))`.
+Each entry is an `SVector{3,Float64}`; spins are `a = J/M` in primary-mass
+units. Times outside the tabulated range are allowed.
+"""
 @inline function (orbit::DevBinaryOrbit)(t::Real)
     time = Float64(t)
     nt = length(orbit.times)
@@ -642,6 +663,14 @@ Adapt.@adapt_structure DevBinaryOrbit
     )
 end
 
+
+"""
+    Adapt.adapt_structure(to, st::SuperposedBoostedKerrSchildCartesian)
+
+Adapt the metric's orbit storage to `to`, preserving the mass ratio.
+The orbit type must support adaptation; this method does not itself
+upload a CPU `BinaryOrbit` to the GPU.
+"""
 function Adapt.adapt_structure(
     to, st::SuperposedBoostedKerrSchildCartesian,
 )
@@ -651,12 +680,29 @@ function Adapt.adapt_structure(
 end
 
 # ---------------------------------------------------------------- binary image kernel
+"""
+    _sbks_image_kernel!(image, statuses, steps, rays, st,
+                        blk, xlft, dxb, lo, hi,
+                        ni, nj, nk, nmb, gp,
+                        C, escape, nmax, capture_factor)
 
+Trace one ray per CUDA thread and accumulate unpolarized intensity
+from the fixed AMR fluid snapshot.
+
+Use negative affine RK4 steps through the time-dependent binary metric.
+Evaluate each segment's radiation coefficients at its camera-side endpoint
+and weight its emission by the accumulated foreground transmission.
+
+Write intensity, completed step count, and termination status:
+1 = captured, 2 = escaped, 3 = step limit, 4 = invalid calculation.
+Failed rays receive `NaN` intensity. Capture uses approximate individual-BH
+boundaries; escape requires outward motion beyond `escape`.
+"""
 function _sbks_image_kernel!(
     image, statuses, steps, rays, st,
     blk, xlft, dxb, lo, hi,
     ni, nj, nk, nmb, gp,
-    C, escape, nmax, capture_factor, emission_half_width,
+    C, escape, nmax, capture_factor,
 )
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
 
@@ -714,37 +760,35 @@ function _sbks_image_kernel!(
             end
 
             # Camera-side coefficients over a positive affine interval.
-            if maximum(abs, SVector(x[2], x[3], x[4])) <= emission_half_width
-                prim = _gamr_sample_scan(
-                    blk, xlft, dxb, lo, hi,
-                    ni, nj, nk, nmb, x[2], x[3], x[4],
+            prim = _gamr_sample_scan(
+                blk, xlft, dxb, lo, hi,
+                ni, nj, nk, nmb, x[2], x[3], x[4],
+            )
+
+            if prim[1] > 0.0 && prim[5] > 0.0 &&
+               !(prim[6] == 0.0 && prim[7] == 0.0 && prim[8] == 0.0)
+
+                kcov = SVector(y[5], y[6], y[7], y[8])
+                gcov = G.metric(st, x)
+                gcon = G.inverse_metric(st, x)
+
+                j_inv, a_inv = _gimg_coeffs_st(
+                    prim, kcov, gcov, gcon, gp,
                 )
 
-                if prim[1] > 0.0 && prim[5] > 0.0 &&
-                   !(prim[6] == 0.0 && prim[7] == 0.0 && prim[8] == 0.0)
+                if !(isfinite(j_inv) && isfinite(a_inv))
+                    status = 4
+                    break
+                end
 
-                    kcov = SVector(y[5], y[6], y[7], y[8])
-                    gcov = G.metric(st, x)
-                    gcon = G.inverse_metric(st, x)
+                ds = h * gp.L_unit / gp.nu_obs
+                A, B = _gimg_ab(j_inv, a_inv, ds)
+                Iinv += trans * B
+                trans *= A
 
-                    j_inv, a_inv = _gimg_coeffs_st(
-                        prim, kcov, gcov, gcon, gp,
-                    )
-
-                    if !(isfinite(j_inv) && isfinite(a_inv))
-                        status = 4
-                        break
-                    end
-
-                    ds = h * gp.L_unit / gp.nu_obs
-                    A, B = _gimg_ab(j_inv, a_inv, ds)
-                    Iinv += trans * B
-                    trans *= A
-
-                    if !(isfinite(Iinv) && isfinite(trans))
-                        status = 4
-                        break
-                    end
+                if !(isfinite(Iinv) && isfinite(trans))
+                    status = 4
+                    break
                 end
             end
 
@@ -762,7 +806,36 @@ function _sbks_image_kernel!(
 end
 
 # ---------------------------------------------------------------- binary host renderer
+"""
+    render_gpu_spacetime(cfg,
+                        st::SuperposedBoostedKerrSchildCartesian,
+                        snap_or_scangrid;
+                        t_obs, capture_factor, polarized=false,
+                        C=80.0, nmax=cfg.max_steps,
+                        device=CUDA.deviceid(CUDA.device()),
+                        return_status=false)
 
+Render unpolarized radiation through the time-dependent binary metric
+on one CUDA device. The fluid snapshot stays fixed along each ray.
+
+Pass a CPU metric containing a `BinaryOrbit` and either an `AthenaKSnapshot`
+or a `DeviceAMRScanGrid` uploaded to `device`. Require numerical tracing;
+polarized rendering is not supported.
+
+`t_obs` sets the camera time. `capture_factor >= 1` sets approximate
+BH capture boundaries, `C` controls distance-based sampling, and `nmax`
+limits steps per ray. Escape occurs on outward motion beyond
+`1.1 * cfg.camera.distance`. Orbit endpoint extrapolation is allowed.
+
+`cfg.m_bh_cgs` sets the physical primary BH mass. The snapshot's
+internal-energy conversion must match `cfg.plasma.gamma`.
+
+Return an intensity matrix with rows in beta and columns in alpha.
+With `return_status=true`, return `(I, status, steps)` instead:
+1 = captured, 2 = escaped, 3 = step limit, 4 = invalid calculation.
+Failed rays have `NaN` intensity; without `return_status`, failures raise
+an error.
+"""
 function render_gpu_spacetime(
     cfg,
     st::SuperposedBoostedKerrSchildCartesian,
@@ -772,7 +845,6 @@ function render_gpu_spacetime(
     polarized::Bool=false,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
-    emission_half_width::Float64=Inf,
     device::Integer=CUDA.deviceid(CUDA.device()),
     return_status::Bool=false,
 )
@@ -790,8 +862,6 @@ function render_gpu_spacetime(
         throw(ArgumentError("capture_factor must be finite and at least 1"))
     0 < nmax <= typemax(Int32) ||
         throw(ArgumentError("nmax must fit in a positive Int32"))
-    emission_half_width > 0.0 ||
-        throw(ArgumentError("emission_half_width must be positive"))
     cfg.camera.resolution > 0 ||
         throw(ArgumentError("camera resolution must be positive"))
     isfinite(cfg.camera.distance) && cfg.camera.distance > 0.0 ||
@@ -845,7 +915,7 @@ function render_gpu_spacetime(
         sg.dev_lo[dev],
         sg.dev_hi[dev],
         sg.ni, sg.nj, sg.nk, sg.nmb,
-        gp, C, escape, nmax, capture_factor, emission_half_width,
+        gp, C, escape, nmax, capture_factor,
     )
     CUDA.synchronize()
 

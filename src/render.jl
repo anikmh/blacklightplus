@@ -280,7 +280,27 @@ function polunpol_consistency(cfg::RunConfig, snapshot_path::AbstractString)
     return sum(ipol) / sum(iunp)
 end
 
+"""
+    _pipeline_setup(cfg::RunConfig, snapshot,
+                    st::SuperposedBoostedKerrSchildCartesian;
+                    t_obs, capture_factor, C=80.0,
+                    nmax=cfg.max_steps, max_step=Inf,
+                    max_coord_step=1.0)
 
+Prepare the camera, sampled rays, physical units, and fluid sampler
+for CPU binary rendering. Accept a loaded `AthenaKSnapshot` or a path
+supported by `_load_athenak`.
+
+The metric evolves along each ray while the fluid snapshot stays fixed.
+The snapshot's internal-energy conversion must match `cfg.plasma.gamma`;
+`cfg.m_bh_cgs` sets the physical primary BH mass.
+
+Trace from observation time `t_obs` with escape radius
+`1.1 * cfg.camera.distance`. See `trace_rays_sampled` for step controls
+and capture conditions.
+
+Return the named tuple `(st, cam, rays, states, dls, u, sampler)`.
+"""
 function _pipeline_setup(
     cfg::RunConfig,
     snapshot,
@@ -291,10 +311,7 @@ function _pipeline_setup(
     nmax::Int=cfg.max_steps,
     max_step::Float64=Inf,
     max_coord_step::Float64=1.0,
-    emission_half_width::Float64=Inf,
 )
-    emission_half_width > 0.0 ||
-        throw(ArgumentError("emission_half_width must be positive"))
 
     cam = PlaneParallelCamera(
         cfg.camera.inclination_deg,
@@ -321,11 +338,6 @@ function _pipeline_setup(
     γ = cfg.plasma.gamma
 
     sampler = x -> begin
-        if maximum(abs, SVector(x[2], x[3], x[4])) > emission_half_width
-            z3 = zero(SVector{3,Float64})
-            return (rho=0.0, pgas=0.0, uu=z3, bb=z3, inside=false)
-        end
-
         s = sample_primitives(snap, x)
         return (
             rho=s.rho,
@@ -342,7 +354,24 @@ function _pipeline_setup(
     )
 end
 
+"""
+    render(cfg::RunConfig, snapshot,
+           st::SuperposedBoostedKerrSchildCartesian;
+           t_obs, capture_factor, polarized=cfg.polarized,
+           C=80.0, nmax=cfg.max_steps, max_step=Inf,
+           max_coord_step=1.0)
 
+Render unpolarized radiation from a fixed fluid snapshot through the
+time-dependent binary metric on CPU threads.
+
+Require `cfg.tracer == :numerical` and `polarized == false`.
+Use `_pipeline_setup` to prepare trajectories, then integrate radiation
+in source-to-camera order with `unpolarized_march`.
+
+Return `(I, Q, U, V)` as camera-resolution matrices, with Q, U, and V
+set to zero. Rows correspond to beta and columns to alpha.
+See `_pipeline_setup` for input and unit conventions.
+"""
 function render(
     cfg::RunConfig,
     snapshot,
@@ -354,7 +383,6 @@ function render(
     nmax::Int=cfg.max_steps,
     max_step::Float64=Inf,
     max_coord_step::Float64=1.0,
-    emission_half_width::Float64=Inf,
 )
     cfg.tracer === :numerical ||
         throw(ArgumentError("the binary metric requires tracer=:numerical"))
@@ -371,7 +399,6 @@ function render(
         nmax=nmax,
         max_step=max_step,
         max_coord_step=max_coord_step,
-        emission_half_width=emission_half_width,
     )
     (; cam, rays, states, dls, u, sampler) = setup
     scc = _prepared_scc(cfg, u)

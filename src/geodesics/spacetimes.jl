@@ -159,17 +159,16 @@ function trace_rays_sampled(st::SuperposedKerrSchild{N}, rays::Vector{SVector{8,
     return states, dls
 end
 
-
 """
     SuperposedBoostedKerrSchildCartesian(q, orbit)
 
 Time-dependent superposed boosted Kerr-Schild binary metric in Cartesian
-coordinates, following the Athena++ binary-metric implementation.
+coordinates, following Athena++'s binary-metric implementation.
 
-Uses coordinates x = (t, x, y, z), signature (-,+,+,+), and units
-G = c = M₁ = 1. The BH masses are M₁ = 1 and M₂ = q.
+Use coordinate four-vectors `x = (t, x, y, z)`, signature (-,+,+,+),
+and units G = c = M1 = 1. The BH masses are 1 and `q = M2/M1`.
 
-The callable `orbit(t)` must return a named tuple:
+The callable `orbit(t)` must return:
 
     (
         center   = (c1, c2),
@@ -177,25 +176,30 @@ The callable `orbit(t)` must return a named tuple:
         spin     = (a1, a2),
     )
 
-Each cA, vA, and aA is an `SVector{3,Float64}`. Positions, velocities,
-and spins are evaluated at simulation coordinate time t.
+Each entry is a spatial three-vector of type `SVector{3,Float64}`,
+evaluated at simulation coordinate time `t`.
 
-Spin vectors are a = J/M, where a and J are three-vectors.
-The vector a has dimensions of length; χ = a/M is dimensionless.
-Any secondary-spin mass scaling must already be applied by `orbit(t)`.
+Spins are `a = J/M`, with dimensions of length; the dimensionless
+spin is `chi = a/M`. Secondary-spin mass scaling must already
+be applied by `orbit(t)`.
 
-The metric is assembled as
-
-    g_{μν} = η_{μν} + f₁ ℓ⁽¹⁾_μ ℓ⁽¹⁾_ν + f₂ ℓ⁽²⁾_μ ℓ⁽²⁾_ν.
-
-Includes Athena++'s small-position adjustment, interior radius
-regularization, and finite-difference derivative prescription.
+Add both boosted BH contributions to the Minkowski metric, including
+Athena++'s position adjustments, interior radius regularization,
+and finite-difference derivative prescription.
 """
 struct SuperposedBoostedKerrSchildCartesian{F} <: AnalyticSpacetime{Float64}
     q::Float64
     orbit::F
 end
 
+"""
+    SuperposedBoostedKerrSchildCartesian(q::Real, orbit)
+
+Construct the binary metric with mass ratio `q = M2/M1` and callable
+`orbit(t)`, converting `q` to `Float64`. Units are G = c = M1 = 1.
+
+See the type documentation for the required orbit format.
+"""
 SuperposedBoostedKerrSchildCartesian(q::Real, orbit) =
     SuperposedBoostedKerrSchildCartesian{typeof(orbit)}(
         Float64(q), orbit
@@ -205,11 +209,15 @@ SuperposedBoostedKerrSchildCartesian(q::Real, orbit) =
 const _SBKS_SMALL = 1.0e-7
 const _SBKS_DELTA = 1.0e-4
 
+"""
+    _sbks_adjust_position(X, a) -> (X_adjusted, D)
 
-# 1. Reproduce Athena++'s small-a⋅X position adjustment.
-#
-# The returned D is deliberately assigned ±SMALL in this branch.
-# It is not necessarily exactly dot(a, X) after the adjustment.
+Apply Athena++'s small-position adjustment to the BH-rest-frame position
+`X` and spin `a = J/M`, both spatial three-vectors.
+
+In the adjustment branch, `D` is set to ±`_SBKS_SMALL` and need not equal
+`dot(a, X_adjusted)` exactly.
+"""
 function _sbks_adjust_position(X, a)
     amag = sqrt(dot(a, a))
     D = dot(a, X)
@@ -225,8 +233,16 @@ function _sbks_adjust_position(X, a)
     return X, D
 end
 
+"""
+    _sbks_rest_position(position, center, velocity, spin) -> (X, lorentz, K)
 
-# 2. Transform the displacement into the instantaneous BH rest frame.
+Transform the displacement from the BH center into its instantaneous
+rest frame and apply Athena++'s small-position adjustment.
+
+All inputs are spatial three-vectors, with `spin = J/M`.
+Return the adjusted position `X`, Lorentz factor `lorentz`, and
+boost coefficient `K = lorentz^2 / (lorentz + 1)`.
+"""
 function _sbks_rest_position(position, center, velocity, spin)
     d = position - center
 
@@ -242,9 +258,16 @@ function _sbks_rest_position(position, center, velocity, spin)
     return X, lorentz, K
 end
 
+"""
+    _sbks_radius_angles(X, a) -> (r, theta_aux, phi_aux)
 
-# 3. Calculate the KS radius and auxiliary angles used by the
-#    interior regularization.
+Calculate the Kerr-Schild radius and auxiliary angles used by Athena++'s
+interior regularization. `X` and `a = J/M` are rest-frame spatial
+position and spin three-vectors.
+
+The angles describe the spatial Kerr-Schild covector direction in the
+fixed coordinate axes, rather than general spin-aligned coordinates.
+"""
 function _sbks_radius_angles(X, a)
     amag = sqrt(dot(a, a))
 
@@ -273,8 +296,17 @@ function _sbks_radius_angles(X, a)
     return r, theta_aux, phi_aux
 end
 
+"""
+    _sbks_bh_contribution(mass, center, velocity, spin, position)
 
-# 4. Calculate one BH's covariant metric contribution f * l_mu * l_nu.
+Return one BH's covariant metric contribution as a 4×4 matrix in
+(t, x, y, z) order.
+
+`center`, `velocity`, `spin = J/M`, and `position` are spatial
+three-vectors. Apply Athena++'s boosts, position adjustments, and
+interior radius prescription `r >= 0.8r_plus`, where `r_plus` is
+the individual Kerr horizon radius.
+"""
 function _sbks_bh_contribution(mass, center, velocity, spin, position)
     X, lorentz, K =
         _sbks_rest_position(position, center, velocity, spin)
@@ -324,8 +356,16 @@ function _sbks_bh_contribution(mass, center, velocity, spin, position)
     return f * (l * transpose(l))
 end
 
+"""
+    metric(st::SuperposedBoostedKerrSchildCartesian, x::SVector{4})
 
-# 5. Assemble the time-dependent binary metric.
+Return the covariant binary metric at coordinate four-vector
+`x = (t, x, y, z)`, with signature (-,+,+,+).
+
+Evaluate both BHs using `st.orbit(x[1])` and add their boosted
+Kerr-Schild contributions to the Minkowski metric.
+The component masses are 1 and `st.q`, in units G = c = M1 = 1.
+"""
 function metric(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4},
@@ -354,8 +394,12 @@ function metric(
     return ETA + h1 + h2
 end
 
+"""
+    inverse_metric(st::SuperposedBoostedKerrSchildCartesian, x::SVector{4})
 
-# 6. Invert the combined metric.
+Return the inverse binary metric at coordinate four-vector
+`x = (t, x, y, z)` by inverting the full combined covariant metric.
+"""
 function inverse_metric(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4},
@@ -363,14 +407,18 @@ function inverse_metric(
     return inv(metric(st, x))
 end
 
+"""
+    metric_gradient(st::SuperposedBoostedKerrSchildCartesian,
+                    x::SVector{4,Float64})
 
-# 7. Covariant metric derivatives.
-#
-# Return convention:
-#   dg[mu, nu, sigma] = ∂g_{mu nu} / ∂x^sigma
-#
-# Julia indices 1,2,3,4 correspond to coordinates t,x,y,z.
-# Uses Athena++'s forward-difference increment and interior cutoff.
+Return covariant metric derivatives as `dg[mu, nu, sigma]`, where
+`sigma = 1:4` corresponds to differentiation in (t, x, y, z).
+
+Use Athena++'s forward-difference increment of 1e-4, dividing by the
+actual floating-point increment. Time derivatives include orbital motion.
+Apply Athena++'s interior cutoff, setting all derivatives to zero when
+either BH's adjusted rest-frame position satisfies `norm(X) <= norm(spin)`.
+"""
 function metric_gradient(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4,Float64},
@@ -419,10 +467,16 @@ function metric_gradient(
     return SArray{Tuple{4,4,4},Float64,3,64}(dg)
 end
 
+"""
+    inverse_metric_gradient(st::SuperposedBoostedKerrSchildCartesian,
+                            x::SVector{4,Float64})
 
-# 8. Inverse-metric derivatives required by the Hamiltonian integrator.
-#
-# ∂g⁻¹ = -g⁻¹ (∂g) g⁻¹
+Return inverse-metric derivatives as `dg_inv[mu, nu, sigma]`, with
+derivative indices in (t, x, y, z) order.
+
+Apply `∂g_inv = -g_inv * (∂g) * g_inv` using the combined metric inverse
+and the covariant derivatives from `metric_gradient`.
+"""
 function inverse_metric_gradient(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4,Float64},
@@ -447,7 +501,22 @@ function inverse_metric_gradient(
     return SArray{Tuple{4,4,4},Float64,3,64}(dginv)
 end
 
+"""
+    _sbks_trace_geometry(st::SuperposedBoostedKerrSchildCartesian,
+                         x::SVector{4,Float64}, capture_factor::Float64)
 
+Return `(valid, captured, dmin, R)` at coordinate four-vector `x`,
+evaluating both BHs at time `x[1]`.
+
+`R` is the distance from the coordinate origin. `dmin` is the smallest
+difference between a BH-rest-frame Kerr-Schild radius and its individual
+Kerr horizon radius.
+
+Capture occurs if either radius is at most
+`capture_factor * r_plus + HORIZON_EPS_SAMPLED`. This is an approximate
+absorbing boundary; the capture factor does not change `dmin`.
+Invalid geometry returns `valid=false`.
+"""
 @inline function _sbks_trace_geometry(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4,Float64},
@@ -494,7 +563,35 @@ end
     return (valid=isfinite(R), captured=captured, dmin=dmin, R=R)
 end
 
+"""
+    trace_rays_sampled(st::SuperposedBoostedKerrSchildCartesian, rays;
+                       capture_factor, C=80.0, escape=ESCAPE_RADIUS,
+                       nmax=20000, R_em=Inf, max_step=Inf,
+                       max_coord_step=1.0, cell_size_fn=nothing,
+                       cell_frac=1.0, return_status=false)
 
+Trace rays through the time-dependent binary metric using threaded CPU
+RK4 integration. Input states contain (t, x, y, z) and future-directed
+covariant photon momentum. Negative affine steps trace toward the source.
+
+`capture_factor >= 1` sets approximate moving-BH capture boundaries.
+`C` controls distance-based sampling; `max_step` caps the affine step,
+and `max_coord_step` limits the estimated coordinate displacement.
+An optional `cell_size_fn(x)` further limits the estimated spatial
+displacement to `cell_frac` times the local cell size.
+These controls do not estimate integration error.
+
+Stop on capture or outward motion beyond `escape` or `R_em`.
+`R_em` is a spherical stopping radius, not a fluid mask.
+Invalid states and exhausted step budgets raise errors.
+
+Return `(states, dls)` in source-to-camera order, with positive affine
+intervals and a final zero interval. With `return_status=true`, also
+return per-ray statuses `:captured`, `:escaped`, or `:emission_exit`.
+
+Initial states must already contain the observation time.
+Orbit time-range checks depend on the supplied orbit callable.
+"""
 function trace_rays_sampled(
     st::SuperposedBoostedKerrSchildCartesian,
     rays::Vector{SVector{8,Float64}};
@@ -616,8 +713,17 @@ function trace_rays_sampled(
     return return_status ? (states, dls, status) : (states, dls)
 end
 
-# Binary camera methods
+"""
+    camera_rays(st::SuperposedBoostedKerrSchildCartesian,
+                cam::PlaneParallelCamera; t_obs)
 
+Build one ray per image pixel center at observation time `t_obs`,
+using `camera_rays_at` to initialize position and photon momentum.
+
+Return a `Vector{SVector{8,Float64}}` with beta varying fastest.
+Reshaping pixel values to `(cam.npix, cam.npix)` gives rows in beta
+and columns in alpha.
+"""
 function camera_rays(
     st::SuperposedBoostedKerrSchildCartesian,
     cam::PlaneParallelCamera;
@@ -629,7 +735,20 @@ function camera_rays(
     return camera_rays_at(st, cam, coords; t_obs=t_obs)
 end
 
+"""
+    camera_rays_at(st::SuperposedBoostedKerrSchildCartesian,
+                   cam::PlaneParallelCamera, coords; t_obs)
 
+Build rays at the supplied image-plane coordinates `(alpha, beta)`,
+setting each ray's coordinate time to `t_obs`.
+
+Construct future-directed null momentum pointing outward in the local
+Eulerian observer's frame, normalized to observer energy `-p_mu * u^mu = 1`.
+Use negative affine steps to trace these rays toward the source.
+
+Return states `[t, x, y, z, p_t, p_x, p_y, p_z]` as
+`SVector{8,Float64}` values in the same order as `coords`.
+"""
 function camera_rays_at(
     st::SuperposedBoostedKerrSchildCartesian,
     cam::PlaneParallelCamera,
