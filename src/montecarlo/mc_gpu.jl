@@ -702,3 +702,381 @@ function mc_spectrum_gpu(model::SphereModel, table::HotcrossTable, Ns::Real;
     return ScatterResult(orders, total, K, N_gen, n_children_total,
                          w_primary, w_children, w_first_order, scatter_loss)
 end
+
+# ======================================================================================
+# GPU BINARY GRMHD MONTE CARLO (time-dependent superposed boosted Kerr-Schild binary)
+#
+# Device twin of the binary `mc_spectrum_grmhd` (mc_cpu.jl): seed packets are
+# generated on the host with the CPU recipe (same zones, weight table, counts and
+# Philox streams, so the packet list is identical to the CPU path), uploaded, and
+# tracked on the device through the binary metric (`DevBinaryOrbit`) and the
+# scan-located AMR fluid (`_gamr_sample_scan`, gpu_spacetime.jl). The fluid decode
+# reuses the GPU imager's `_gimg_pfv` / `_gimg_theta_e`, so the device Monte Carlo
+# sees the same plasma as the GPU images; absorption and the Compton kernel reuse
+# the CPU functions (`_grmhd_nu_alpha`, `_mc_scatter_event`, `scatter_superphoton`,
+# `_hotcross_lookup`). Scattering is layered as in the sphere GPU path: the
+# primary kernel appends Compton children to a device buffer (atomic slot
+# counter); the host relaunches the march on each order's children.
+
+isdefined(@__MODULE__, :_gamr_sample_scan) ||
+    Base.include(@__MODULE__, joinpath(@__DIR__, "..", "gpu_spacetime.jl"))
+
+using BlackLightPlus: SuperposedBoostedKerrSchildCartesian, BinaryOrbit, GRMHDModel
+const _MCB_G = BlackLightPlus.Geodesics
+const _MCB_MP = BlackLightPlus.Constants.MP
+
+# Host -> backend array (Array on CPU(), device array on a GPU backend).
+function _mcb_to(backend, A::AbstractArray)
+    B = KernelAbstractions.allocate(backend, eltype(A), size(A))
+    copyto!(B, A)
+    return B
+end
+
+# Emitting-plasma state at x on the device: the CPU `plasma_at` decode with the
+# GPU imager's fluid-decode bodies. Vacuum (inside = false) outside the grid, for
+# non-positive density/pressure, zero field, b^2 <= 0, or a sigma / Theta_e cut.
+@inline function _mcb_plasma_at(st, x::SVector{4,Float64}, fl, gp)
+    gcov = _MCB_G.metric(st, x)
+    gcon = _MCB_G.inverse_metric(st, x)
+    z4 = zero(SVector{4,Float64})
+    vac = (n_e = 0.0, theta_e = 0.0, B = 0.0, ucon = z4, ucov = z4, bcon = z4,
+           gcov = gcov, gcon = gcon, inside = false)
+    prim = _gamr_sample_scan(fl.blk, fl.xlft, fl.dxb, fl.lo, fl.hi,
+                             fl.ni, fl.nj, fl.nk, fl.nmb, x[2], x[3], x[4])
+    rho = prim[1]
+    rho <= 0.0 && return vac
+    (prim[6] == 0.0 && prim[7] == 0.0 && prim[8] == 0.0) && return vac
+    pgas = (gp.gamma - 1.0) * prim[5]
+    pgas <= 0.0 && return vac
+    ucon, ucov, bcon, b_sq = _gimg_pfv(prim[2], prim[3], prim[4],
+                                       prim[6], prim[7], prim[8], gcov, gcon)
+    b_sq <= 0.0 && return vac
+    rho_cgs = rho * gp.d_unit
+    pgas_cgs = pgas * gp.e_unit
+    n_e = rho_cgs / (gp.mu * _MCB_MP) / (1.0 + 1.0 / gp.ne_ni)
+    bb = sqrt(b_sq) * gp.b_unit
+    sigma = b_sq / rho
+    beta_inv = b_sq / (2.0 * pgas)
+    theta_e = _gimg_theta_e(rho_cgs, pgas_cgs, beta_inv, gp)
+    (gp.sigma_cut >= 0.0 && sigma > gp.sigma_cut) && return vac
+    (gp.theta_e_min >= 0.0 && theta_e < gp.theta_e_min) && return vac
+    return (n_e = n_e, theta_e = theta_e, B = bb, ucon = ucon, ucov = ucov, bcon = bcon,
+            gcov = gcov, gcon = gcon, inside = true)
+end
+
+# Device scattering rate nu * alpha_s (CPU `_grmhd_nu_alpha_scatt` with the uploaded
+# hot-cross table `logsig`).
+@inline function _mcb_nu_alpha_scatt(logsig, pl, p::SVector{4})
+    pl.inside || return 0.0
+    kdotu = dot(p, pl.ucon)
+    kdotu >= 0.0 && return 0.0
+    nu = -kdotu * ME * CL * CL / HPL
+    eps = HPL * nu / (ME * CL * CL)
+    return nu * pl.n_e * _MCM._hotcross_lookup(logsig, eps, pl.theta_e)
+end
+
+# Device binary geometry (CPU `_grmhd_binary_geometry` without `error`):
+# status 0 = step, 1 = captured, 4 = invalid.
+@inline function _mcb_geometry(st, y::SVector{8,Float64}, cf::Float64, C::Float64)
+    x = SVector(y[1], y[2], y[3], y[4])
+    ctl = _MCB_G._sbks_trace_geometry(st, x, cf)
+    ctl.valid || return (4, 0.0, 0.0)
+    ctl.captured && return (1, ctl.R, 0.0)
+    rhs = _MCB_G.geodesic_rhs(st, y)
+    rhs[1] > 0.0 || return (4, ctl.R, 0.0)
+    rate = max(abs(rhs[1]), sqrt(rhs[2] * rhs[2] + rhs[3] * rhs[3] + rhs[4] * rhs[4]))
+    h = min(ctl.dmin / C, _MCM._GRMHD_BINARY_MAX_COORD_STEP) / rate
+    (isfinite(h) && h > 0.0) || return (4, ctl.R, 0.0)
+    return (0, ctl.R, h)
+end
+
+# Atomic record of an escaped packet (CPU `_grmhd_record_binary!` + `record_energy!`).
+@inline function _mcb_record!(acc, st, x::SVector{4,Float64}, p::SVector{4,Float64}, w, q)
+    E = -p[1]
+    E > 0.0 || return nothing
+    nu = E * ME * CL * CL / HPL
+    ie = unsafe_trunc(Int, floor((log(nu) - q.lnu_min) / q.dlnu)) + 1
+    (ie < 1 || ie > q.n_ebins) && return nothing
+    kcon = _MCB_G.inverse_metric(st, x) * p
+    ksp = sqrt(kcon[2] * kcon[2] + kcon[3] * kcon[3] + kcon[4] * kcon[4])
+    ksp <= 0.0 && return nothing
+    th = acos(clamp(kcon[4] / ksp, -1.0, 1.0))
+    dphi = 2.0 * π / q.n_phi
+    j = min(q.n_phi, unsafe_trunc(Int, floor(mod(atan(kcon[3], kcon[2]) + 0.5 * dphi, 2.0 * π) / dphi)) + 1)
+    KernelAbstractions.@atomic acc.tot_cnt[ie] += Int64(1)
+    KernelAbstractions.@atomic acc.tot_w[ie] += w
+    KernelAbstractions.@atomic acc.tot_wE[ie] += w * E
+    @inbounds for b in 1:q.n_bands
+        if th >= acc.lo[b] && th <= acc.hi[b]
+            KernelAbstractions.@atomic acc.cnt[b, j, ie] += Int64(1)
+            KernelAbstractions.@atomic acc.sw[b, j, ie] += w
+            KernelAbstractions.@atomic acc.swE[b, j, ie] += w * E
+        end
+    end
+    return nothing
+end
+
+# One packet's march (device twin of the binary CPU trackers). With
+# `q.scattering`, the biased Compton trigger appends children (order
+# nscatt + 1) to `out` through the atomic slot counter. Escaped packets are
+# recorded (power in acc.esc[1]).
+@inline function _mcb_march!(acc, out, st, fl, gp, logsig, q,
+                             x0::SVector{4,Float64}, p0::SVector{4,Float64}, w0::Float64,
+                             tau_a0::Float64, tau_s0::Float64, nscatt::Int32, rng::MCRng)
+    y = SVector(x0[1], x0[2], x0[3], x0[4], p0[1], p0[2], p0[3], p0[4])
+    x = x0; p = p0; w = w0; tau_a = tau_a0; tau_s = tau_s0
+    Cgr = q.L_unit * HPL / (ME * CL * CL)
+    pl = _mcb_plasma_at(st, x, fl, gp)
+    na0 = _MCM._grmhd_nu_alpha(pl, p)
+    ns0 = q.scattering ? _mcb_nu_alpha_scatt(logsig, pl, p) : 0.0
+    r_prev = Inf
+    status = 3
+    nspawn = 0
+    for _ in 1:q.max_steps
+        s, r, h = _mcb_geometry(st, y, q.cf, q.C)
+        if s != 0
+            status = s
+            break
+        end
+        if r > q.R_record || (r > q.Rem && r > r_prev)
+            status = 2
+            break
+        end
+        r_prev = r
+        y2 = _MCB_G.rk4_step_fixed(st, y, h)
+        xn = SVector(y2[1], y2[2], y2[3], y2[4])
+        pn = SVector(y2[5], y2[6], y2[7], y2[8])
+        pln = _mcb_plasma_at(st, xn, fl, gp)
+        na1 = _MCM._grmhd_nu_alpha(pln, pn)
+        dtau_a = 0.5 * (na0 + na1) * Cgr * h
+        dtau_s = 0.0
+        if q.scattering
+            ns1 = _mcb_nu_alpha_scatt(logsig, pln, pn)
+            dtau_s = 0.5 * (ns0 + ns1) * Cgr * h
+            if dtau_s > 0.0 && pln.inside && Int(nscatt) < q.max_scatt
+                b = _MCM.grmhd_bias(q.bias0, pln.theta_e, nscatt)
+                spawn, weight_scat, frac, rng =
+                    _MCM._mc_scatter_event(w, b, dtau_s, _MCM._MC_WEIGHT_MIN, rng)
+                if spawn
+                    yev = _MCB_G.rk4_step_fixed(st, y, h * frac)
+                    xev = SVector(yev[1], yev[2], yev[3], yev[4])
+                    pev = SVector(yev[5], yev[6], yev[7], yev[8])
+                    plev = _mcb_plasma_at(st, xev, fl, gp)
+                    if plev.inside
+                        p_new, rng = _mc_scatter_mom(pev, plev.ucon, plev.ucov, plev.bcon,
+                                                     plev.theta_e, plev.gcov, plev.gcon, rng)
+                        nspawn += 1
+                        slot = (KernelAbstractions.@atomic out.ctr[1] += Int64(1)) - Int64(1)
+                        if slot < q.cap
+                            k = Int(slot) + 1
+                            @inbounds begin
+                                out.x[k] = xev
+                                out.p[k] = p_new
+                                out.w[k] = weight_scat * exp(-dtau_a * frac)
+                                out.tau[k] = SVector(tau_a, tau_s)
+                                out.n[k] = nscatt + Int32(1)
+                                out.rng[k] = _MCM._mc_child_rng(rng, nspawn)
+                            end
+                        end
+                    end
+                end
+            end
+            ns0 = ns1
+        end
+        w *= exp(-(dtau_a + dtau_s))
+        tau_a += dtau_a
+        tau_s += dtau_s
+        y = y2; x = xn; p = pn; na0 = na1
+    end
+    if status == 2
+        KernelAbstractions.@atomic acc.esc[1] += w * (-p[1])
+        KernelAbstractions.@atomic acc.nrec[1] += Int64(1)
+        _mcb_record!(acc, st, x, p, w, q)
+    elseif status == 4
+        KernelAbstractions.@atomic acc.ninvalid[1] += Int64(1)
+    elseif status == 3
+        KernelAbstractions.@atomic acc.ncap_steps[1] += Int64(1)
+    end
+    return nothing
+end
+
+# Seed packets (order 0): continue each packet's own generation stream, as the CPU loop does.
+@kernel function _mcb_seed_kernel!(acc, out, st, fl, gp, logsig, q, @Const(xs), @Const(ps),
+                                   @Const(ws), @Const(rngs))
+    i = @index(Global)
+    @inbounds if i <= q.N
+        _mcb_march!(acc, out, st, fl, gp, logsig, q, xs[i], ps[i], ws[i], 0.0, 0.0,
+                    Int32(0), rngs[i])
+    end
+end
+
+# Children of one scattering order, each on the stream its parent derived for it
+# (`_mc_child_rng`, as the CPU tracker), so buffer order does not matter.
+@kernel function _mcb_layer_kernel!(acc, out, st, fl, gp, logsig, q, @Const(xs), @Const(ps),
+                                    @Const(ws), @Const(taus), @Const(ns), @Const(rngs))
+    i = @index(Global)
+    @inbounds if i <= q.N
+        _mcb_march!(acc, out, st, fl, gp, logsig, q, xs[i], ps[i], ws[i], taus[i][1], taus[i][2],
+                    ns[i], rngs[i])
+    end
+end
+
+"""
+    mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
+                          t_emit, capture_factor, C, backend=CUDABackend(),
+                          capacity_factor=0.5, workgroupsize=64, kwargs...)
+        -> GRMHDBinarySpectrumResult
+
+Device version of the binary `mc_spectrum_grmhd`, with the same keywords, physics
+(packets at the step cap are dropped, not
+counted) and result. Seed packets are generated on the host exactly as the CPU
+driver does and tracked on `backend`; children take the same derived streams, so
+every packet draws the same random numbers as on the CPU. On the CPU backend the
+results agree up to summation order; on a GPU, device rounding can send a rare
+packet near a threshold down a different path. `capacity_factor` sizes each
+scattering order's child buffer relative to its parent count; an overflow raises
+an error. Load after `using BlackLightPlus` (and `using CUDA` for `CUDABackend()`).
+"""
+function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
+                               t_emit::Real, capture_factor::Real, C::Real,
+                               backend = CUDABackend(),
+                               n_phi::Integer = 1, scattering::Bool = true,
+                               seed::Integer = 0x51EED5,
+                               incl_deg = (17.0, 50.0, 90.0), half_width_deg::Real = 10.0,
+                               gen_nu_min::Real = 1.0e8, gen_nu_max::Real = 1.0e16,
+                               spec_nu_min::Real = 1.0e8, spec_nu_max::Real = 1.0e24,
+                               n_esamp::Integer = _MCM._MC_N_ESAMP_DEFAULT, n_ebins::Integer = 160,
+                               R_record::Real = 1.0e3, max_scatt::Integer = 3, bias0::Real = 1.0,
+                               stride::Integer = 1, max_zones::Integer = typemax(Int),
+                               r_emit_max::Real = Inf, capacity_factor::Real = 0.5,
+                               workgroupsize::Integer = 64)
+    n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
+    st = model.spacetime
+    st.orbit isa BinaryOrbit || throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
+    cf = Float64(capture_factor)
+
+    # ---- host: zones, tables, counts and seed packets (the CPU recipe) ----
+    zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
+                           max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
+    nz = length(zones)
+    nz == 0 && error("mc_spectrum_grmhd_gpu: no emitting zones (check cuts / snapshot)")
+    band = log(gen_nu_max) - log(gen_nu_min)
+    jt = build_zone_emission_table(zones; n_esamp = n_esamp, nu_min = gen_nu_min, nu_max = gen_nu_max)
+    wgt = build_weight_table(jt, Float64(Ns) / band)
+    Nsz_all, dnmax = zone_counts(jt, wgt)
+    ngen = Vector{Int}(undef, nz)
+    rr = MCRng(Int(seed), 0)
+    for z in 1:nz
+        fl0 = floor(Int, Nsz_all[z])
+        u, rr = mc_uniform(rr)
+        ngen[z] = fl0 + (u < (Nsz_all[z] - fl0) ? 1 : 0)
+    end
+    offset = vcat(0, cumsum(ngen))
+    Ntot = offset[end]
+    Ntot > 0 || error("mc_spectrum_grmhd_gpu: no seed packets generated")
+    xs = Vector{SVector{4,Float64}}(undef, Ntot); ps = similar(xs)
+    ws = Vector{Float64}(undef, Ntot); rngs = Vector{MCRng}(undef, Ntot)
+    Threads.@threads for gid in 1:Ntot
+        z = searchsortedfirst(offset, gid) - 1
+        sp, rng = sample_zone_photon(zones[z], wgt, dnmax[z], MCRng(Int(seed), gid))
+        xs[gid] = sp.x; ps[gid] = sp.p; ws[gid] = sp.w; rngs[gid] = rng
+    end
+    mec2 = ME * CL * CL
+    emitted = mec2 * sum(ws[i] * (-ps[i][1]) for i in 1:Ntot)
+
+    Rem = model.R_em
+    for z in zones
+        Rem = max(Rem, 1.2 * sqrt(z.x[2]^2 + z.x[3]^2 + z.x[4]^2))
+    end
+
+    # ---- device data ----
+    snap = model.snap
+    fl = (blk = _mcb_to(backend, permutedims(snap.data, (5, 1, 2, 3, 4))),
+          xlft = _mcb_to(backend, reduce(hcat, snap.x_left)),
+          dxb = _mcb_to(backend, reduce(hcat, snap.dx)),
+          lo = _mcb_to(backend, reduce(hcat, snap.ext_lo)),
+          hi = _mcb_to(backend, reduce(hcat, snap.ext_hi)),
+          ni = snap.ni, nj = snap.nj, nk = snap.nk, nmb = snap.nmb)
+    orb = st.orbit
+    st_d = SuperposedBoostedKerrSchildCartesian(st.q,
+               DevBinaryOrbit(orb.q, _mcb_to(backend, orb.times), _mcb_to(backend, orb.data), orb.dt))
+    c = model.cfg
+    gp = (d_unit = c.d_unit, e_unit = c.e_unit, b_unit = c.b_unit, mu = c.plasma_mu,
+          ne_ni = c.plasma_ne_ni, use_p = c.plasma_use_p, rat_low = c.plasma_rat_low,
+          rat_high = c.plasma_rat_high, gamma = c.plasma_gamma, gamma_i = c.plasma_gamma_i,
+          gamma_e = c.plasma_gamma_e, sigma_cut = c.cut_sigma_max, theta_e_min = c.cut_theta_e_min)
+    tbl = scattering ? build_hotcross_table() : HotcrossTable(zeros(Float64, 1, 1))
+    logsig = _mcb_to(backend, tbl.logsigma)
+
+    cen = collect(Float64.(incl_deg)); nb = length(cen)
+    hw = deg2rad(Float64(half_width_deg))
+    lo = [clamp(deg2rad(cen[b]) - hw, 0.0, π) for b in 1:nb]
+    hi = [clamp(deg2rad(cen[b]) + hw, 0.0, π) for b in 1:nb]
+    nph = Int(n_phi)
+    proto = Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max, n_ebins = n_ebins, n_thbins = 1)
+    zf(T, dims...) = (A = KernelAbstractions.zeros(backend, T, dims...); A)
+    acc = (tot_cnt = zf(Int64, n_ebins), tot_w = zf(Float64, n_ebins), tot_wE = zf(Float64, n_ebins),
+           cnt = zf(Int64, nb, nph, n_ebins), sw = zf(Float64, nb, nph, n_ebins),
+           swE = zf(Float64, nb, nph, n_ebins), lo = _mcb_to(backend, lo), hi = _mcb_to(backend, hi),
+           esc = zf(Float64, 1), nrec = zf(Int64, 1), ninvalid = zf(Int64, 1), ncap_steps = zf(Int64, 1))
+    qbase = (cf = cf, C = Float64(C), R_record = Float64(R_record), Rem = Rem,
+             L_unit = model.L_unit, max_steps = _MCM._GRMHD_MAX_STEPS,
+             scattering = scattering, max_scatt = Int(max_scatt), bias0 = Float64(bias0),
+             lnu_min = proto.lnu_min, dlnu = proto.dlnu, n_ebins = Int(n_ebins),
+             n_phi = nph, n_bands = nb)
+
+    mkbuf(n) = (x = KernelAbstractions.allocate(backend, SVector{4,Float64}, max(n, 1)),
+                p = KernelAbstractions.allocate(backend, SVector{4,Float64}, max(n, 1)),
+                w = KernelAbstractions.allocate(backend, Float64, max(n, 1)),
+                tau = KernelAbstractions.allocate(backend, SVector{2,Float64}, max(n, 1)),
+                n = KernelAbstractions.allocate(backend, Int32, max(n, 1)),
+                rng = KernelAbstractions.allocate(backend, MCRng, max(n, 1)),
+                ctr = zf(Int64, 1))
+
+    # ---- order 0: seed packets ----
+    cap = scattering ? max(1, ceil(Int, capacity_factor * Ntot)) : 0
+    out = mkbuf(cap)
+    q = merge(qbase, (N = Ntot, cap = cap))
+    _mcb_seed_kernel!(backend, workgroupsize)(acc, out, st_d, fl, gp, logsig, q,
+        _mcb_to(backend, xs), _mcb_to(backend, ps), _mcb_to(backend, ws), _mcb_to(backend, rngs);
+        ndrange = Ntot)
+    KernelAbstractions.synchronize(backend)
+
+    # ---- orders 1..max_scatt: children ----
+    layer = 0
+    while scattering
+        nchild = Int(Array(out.ctr)[1])
+        nchild == 0 && break
+        nchild > cap && error("mc_spectrum_grmhd_gpu: scattering order $(layer + 1) spawned $nchild children " *
+                              "but the buffer holds $cap; raise capacity_factor (dropping them would bias the spectrum)")
+        ntrack = nchild
+        layer += 1
+        parent = out
+        cap = max(1, ceil(Int, capacity_factor * ntrack))
+        out = mkbuf(cap)
+        q = merge(qbase, (N = ntrack, cap = cap))
+        _mcb_layer_kernel!(backend, workgroupsize)(acc, out, st_d, fl, gp, logsig, q,
+            parent.x, parent.p, parent.w, parent.tau, parent.n, parent.rng; ndrange = ntrack)
+        KernelAbstractions.synchronize(backend)
+    end
+    ninv = Int(Array(acc.ninvalid)[1])
+    ninv > 0 && error("mc_spectrum_grmhd_gpu: $ninv packets hit invalid geometry")
+
+    # ---- device bins -> host spectra ----
+    cnt = Array(acc.cnt); sw = Array(acc.sw); swE = Array(acc.swE)
+    bands = [Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max, n_ebins = n_ebins, n_thbins = 1)
+             for _ in 1:nb, _ in 1:nph]
+    for b in 1:nb, j in 1:nph
+        bands[b, j].count[1, :] .= cnt[b, j, :]
+        bands[b, j].sumw[1, :] .= sw[b, j, :]
+        bands[b, j].sumwE[1, :] .= swE[b, j, :]
+    end
+    total = Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max, n_ebins = n_ebins, n_thbins = 1)
+    total.count[1, :] .= Array(acc.tot_cnt); total.sumw[1, :] .= Array(acc.tot_w)
+    total.sumwE[1, :] .= Array(acc.tot_wE)
+    dOmega = [2.0 * π * (cos(lo[b]) - cos(hi[b])) / nph for b in 1:nb, _ in 1:nph]
+    phi_deg = [360.0 * (j - 1) / nph for j in 1:nph]
+    return _MCM.GRMHDBinarySpectrumResult(cen, Float64(half_width_deg), phi_deg, dOmega, bands, total,
+                                     emitted, mec2 * Array(acc.esc)[1], nz, Ntot,
+                                     Int(Array(acc.nrec)[1]), scattering, Float64(t_emit))
+end
