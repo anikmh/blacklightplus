@@ -203,6 +203,14 @@ function GRMHDModel(snap::AthenaKSnapshot, st::SuperposedBoostedKerrSchildCartes
                       NaN, Float64(R_em))
 end
 
+# The binary model with its metric held at coordinate time `t` (BH positions,
+# velocities and spins of `orbit(t)`): the metric the frozen snapshot was evolved
+# with. The binary Monte Carlo drivers always track in it (fast light).
+_freeze_model(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, t::Real) =
+    GRMHDModel(SuperposedBoostedKerrSchildCartesian(model.spacetime.q,
+                   Geodesics._freeze_orbit(model.spacetime.orbit, t)),
+               model.snap, model.cfg, model.gamma, model.L_unit, model.r_h, model.R_em)
+
 """
     emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};
                    t_emit, capture_factor, max_zones=typemax(Int), stride=1,

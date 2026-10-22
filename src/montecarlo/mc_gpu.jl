@@ -709,7 +709,8 @@ end
 # Device twin of the binary `mc_spectrum_grmhd` (mc_cpu.jl): seed packets are
 # generated on the host with the CPU recipe (same zones, weight table, counts and
 # Philox streams, so the packet list is identical to the CPU path), uploaded, and
-# tracked on the device through the binary metric (`DevBinaryOrbit`) and the
+# tracked on the device through the binary metric held at the emission time, as
+# on the CPU (`DevBinaryOrbit` of `_freeze_model`), and the
 # scan-located AMR fluid (`_gamr_sample_scan`, gpu_spacetime.jl). The fluid decode
 # reuses the GPU imager's `_gimg_pfv` / `_gimg_theta_e`, so the device Monte Carlo
 # sees the same plasma as the GPU images; absorption and the Compton kernel reuse
@@ -937,7 +938,7 @@ end
         -> GRMHDBinarySpectrumResult
 
 Device version of the binary `mc_spectrum_grmhd`, with the same keywords, physics
-(bounded bias, step limit and absorption cut, all
+(metric held at `t_emit`, bounded bias, step limit and absorption cut, all
 counted) and result. Seed packets are generated on the host exactly as the CPU
 driver does and tracked on `backend`; children take the same derived streams, so
 every packet draws the same random numbers as on the CPU. On the CPU backend the
@@ -977,6 +978,7 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
     nz = length(zones)
     nz == 0 && error("mc_spectrum_grmhd_gpu: no emitting zones (check cuts / snapshot)")
+    st = _MCM._freeze_model(model, t_emit).spacetime   # fast light: metric held at t_emit
     band = log(gen_nu_max) - log(gen_nu_min)
     jt = build_zone_emission_table(zones; n_esamp = n_esamp, nu_min = gen_nu_min, nu_max = gen_nu_max)
     wgt = build_weight_table(jt, Float64(Ns) / band)

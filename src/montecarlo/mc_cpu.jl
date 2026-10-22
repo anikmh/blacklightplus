@@ -477,7 +477,8 @@ end
 #   - step: coordinate displacement ~ min(d_min / C, 1) with d_min the smallest
 #     distance to an individual horizon, h = that / max(|dt/dl|, |dx/dl|);
 #   - escape on the coordinate distance R from the origin (no single KS radius).
-# Packets move forward in coordinate time (h > 0) from the emission time.
+# Packets move forward in coordinate time (h > 0) from the emission time. The
+# driver always passes a model whose metric is held at that time (`_freeze_model`).
 
 # Largest coordinate displacement per step, as in binary imaging
 # (`trace_rays_sampled` default `max_coord_step = 1.0`; GPU kernel `min(dmin / C, 1.0)`).
@@ -980,8 +981,9 @@ end
         -> GRMHDBinarySpectrumResult
 
 Binary version of `mc_spectrum_grmhd` (other keywords as upstream). Emitting cells
-are built at the snapshot time `t_emit`, and packets are tracked forward in time
-through the binary metric.
+are built at the snapshot time `t_emit`, and packets are always tracked in the
+metric held at `t_emit` (fast light: the frozen snapshot with the BH positions it
+was evolved with; a moving metric would expose gas from inside the horizons).
 Packets are captured at either BH (`capture_factor`, as in binary imaging),
 stopped after `max_steps` steps (counted) and binned by inclination and `n_phi`
 azimuth sectors. `C` has no default (use the imaging value). With scattering,
@@ -1022,6 +1024,7 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
     nz = length(zones)
     nz == 0 && error("mc_spectrum_grmhd: no emitting zones (check cuts / snapshot)")
+    model = _freeze_model(model, t_emit)        # fast light: metric held at t_emit
 
     band = log(gen_nu_max) - log(gen_nu_min)
     Ns_param = Float64(Ns) / band

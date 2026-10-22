@@ -128,3 +128,19 @@ function (orbit::BinaryOrbit)(t::Real)
         ),
     )
 end
+
+"""
+    _freeze_orbit(orbit::BinaryOrbit, t) -> BinaryOrbit
+
+Return `orbit` held at its state at simulation coordinate time `t`.
+
+The result stores that state twice, so calling it at any time returns
+the positions, velocities, and spins of `orbit(t)`.
+"""
+function _freeze_orbit(orbit::BinaryOrbit, t::Real)
+    s = orbit(t)
+    col = Float64[s.center[1]; s.center[2]; s.spin[1]; s.spin[2];
+                  s.velocity[1]; s.velocity[2]]
+    time = Float64(t)
+    return BinaryOrbit(orbit.q, [time - 1.0, time + 1.0], hcat(col, col), 2.0)
+end
