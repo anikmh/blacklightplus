@@ -667,6 +667,48 @@ function incl_nuLnu(res::GRMHDSpectrumResult)
     return nu, L
 end
 
+"""
+    GRMHDBinarySpectrumResult
+
+Output of the binary `mc_spectrum_grmhd`: as `GRMHDSpectrumResult`, with the
+escaped packets also binned in `n_phi` azimuth sectors. `spectra[k, j]` and
+`dOmega[k, j]` belong to band `incl_deg[k] +- half_width_deg` and sector `j`,
+centred on `phi_deg[j]` (sector 1 on +x, the imaging camera's azimuth). Also
+records `t_emit`.
+"""
+struct GRMHDBinarySpectrumResult
+    incl_deg::Vector{Float64}
+    half_width_deg::Float64
+    phi_deg::Vector{Float64}
+    dOmega::Matrix{Float64}
+    spectra::Matrix{Spectrum}
+    total::Spectrum
+    emitted_power::Float64
+    escaped_power::Float64
+    n_zones::Int
+    n_gen::Int
+    n_recorded::Int
+    scattering::Bool
+    t_emit::Float64
+end
+
+"""
+    incl_nuLnu(res::GRMHDBinarySpectrumResult) -> (nu, L)
+
+Isotropic-equivalent `nu L_nu` [erg s^-1] per inclination band and azimuth
+sector: `L[k, j, :]` for `incl_deg[k]` and `phi_deg[j]` (via `nuLnu_solid`).
+"""
+function incl_nuLnu(res::GRMHDBinarySpectrumResult)
+    nu = nu_centers(res.total)
+    nk, nj = size(res.spectra)
+    L = zeros(Float64, nk, nj, length(nu))
+    for k in 1:nk, j in 1:nj
+        _, Lkj, _ = nuLnu_solid(res.spectra[k, j], res.dOmega[k, j])
+        @inbounds L[k, j, :] .= Lkj
+    end
+    return nu, L
+end
+
 # ------------------------------------------------------------ driver
 
 """
@@ -868,6 +910,204 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     e_esc += e.w * e.E
                     nr += 1
                     _grmhd_record!(bands, total, e, st, lo, hi)
+                end
+            end
+        end
+        emit[c] = e_emit
+        esc[c] = e_esc
+        nrec[c] = nr
+    end
+    return nothing
+end
+
+# ------------------------------------------------------------ binary driver
+
+"""
+    mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
+                      t_emit, capture_factor, C, n_phi=1, kwargs...)
+        -> GRMHDBinarySpectrumResult
+
+Binary version of `mc_spectrum_grmhd` (other keywords as upstream). Emitting cells
+are built at the snapshot time `t_emit`, and packets are tracked forward in time
+through the binary metric.
+Packets are captured at either BH (`capture_factor`, as in binary imaging) and
+binned by inclination and `n_phi` azimuth sectors. `C` has no default (use the
+imaging value). Children take
+derived streams (`_mc_child_rng`), so results do not depend on `nthreads`.
+"""
+function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
+                           t_emit::Real, capture_factor::Real, C::Real,
+                           n_phi::Integer = 1,
+                           scattering::Bool = true,
+                           nthreads::Integer = Threads.nthreads(),
+                           seed::Integer = 0x51EED5,
+                           incl_deg = (17.0, 50.0, 90.0),
+                           half_width_deg::Real = 10.0,
+                           gen_nu_min::Real = 1.0e8, gen_nu_max::Real = 1.0e16,
+                           spec_nu_min::Real = 1.0e8, spec_nu_max::Real = 1.0e24,
+                           n_esamp::Integer = _MC_N_ESAMP_DEFAULT,
+                           n_ebins::Integer = 160,
+                           R_record::Real = 1.0e3,
+                           max_scatt::Integer = 3, bias0::Real = 1.0,
+                           stride::Integer = 1, max_zones::Integer = typemax(Int),
+                           r_emit_max::Real = Inf,
+                           table::Union{Nothing,HotcrossTable} = nothing,
+                           tabulated_gen::Bool = false)
+    n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
+    cf = Float64(capture_factor)
+    zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
+                           max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
+    nz = length(zones)
+    nz == 0 && error("mc_spectrum_grmhd: no emitting zones (check cuts / snapshot)")
+
+    band = log(gen_nu_max) - log(gen_nu_min)
+    Ns_param = Float64(Ns) / band
+    jt = build_zone_emission_table(zones;
+                                   n_esamp = n_esamp, nu_min = gen_nu_min, nu_max = gen_nu_max)
+    wgt = build_weight_table(jt, Ns_param; nthreads = nthreads)
+    Nsz_all, dnmax = zone_counts(jt, wgt; nthreads = nthreads)
+    lint = nothing
+    if tabulated_gen
+        lint, dnmax = zone_int_jnu_tables(jt, wgt)
+    end
+
+    ngen = Vector{Int}(undef, nz)
+    rr = MCRng(Int(seed), 0)
+    @inbounds for z in 1:nz
+        Nsz = Nsz_all[z]
+        fl = floor(Int, Nsz)
+        u, rr = mc_uniform(rr)
+        ngen[z] = fl + (u < (Nsz - fl) ? 1 : 0)
+    end
+    offset = Vector{Int}(undef, nz + 1)
+    offset[1] = 0
+    @inbounds for z in 1:nz
+        offset[z + 1] = offset[z] + ngen[z]
+    end
+    Ntot = offset[nz + 1]
+
+    cen = collect(Float64.(incl_deg))
+    nb = length(cen)
+    hw = deg2rad(Float64(half_width_deg))
+    lo = [clamp(deg2rad(cen[b]) - hw, 0.0, π) for b in 1:nb]
+    hi = [clamp(deg2rad(cen[b]) + hw, 0.0, π) for b in 1:nb]
+    nph = Int(n_phi)
+    dOmega = [2.0 * π * (cos(lo[b]) - cos(hi[b])) / nph for b in 1:nb, _ in 1:nph]
+    phi_deg = [360.0 * (j - 1) / nph for j in 1:nph]
+
+    tbl = table !== nothing ? table :
+          scattering ? build_hotcross_table() : HotcrossTable(zeros(Float64, 1, 1))
+
+    # emission-confinement radius on the coordinate distance from the origin
+    Rem = model.R_em
+    @inbounds for z in 1:nz
+        x = zones[z].x
+        Rem = max(Rem, 1.2 * sqrt(x[2] * x[2] + x[3] * x[3] + x[4] * x[4]))
+    end
+
+    nchunks = max(1, Int(nthreads))
+    mkspec() = Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max,
+                        n_ebins = n_ebins, n_thbins = 1)
+    mkbands() = [mkspec() for _ in 1:nb, _ in 1:nph]
+    bands_by_chunk = [mkbands() for _ in 1:nchunks]
+    total_by_chunk = [mkspec() for _ in 1:nchunks]
+    emit = zeros(Float64, nchunks)
+    esc = zeros(Float64, nchunks)
+    nrec = zeros(Int, nchunks)
+
+    _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
+                    model, zones, wgt, dnmax, lint, offset, Ntot, tbl,
+                    Float64(C), Float64(R_record), Rem, Float64(bias0), Int(max_scatt),
+                    scattering, Int(seed), lo, hi; capture_factor = cf)
+
+    bands = mkbands()
+    total = mkspec()
+    for c in 1:nchunks
+        merge_spectra!(total, total_by_chunk[c])
+        for b in 1:nb, j in 1:nph
+            merge_spectra!(bands[b, j], bands_by_chunk[c][b, j])
+        end
+    end
+    mec2 = ME * CL * CL
+    return GRMHDBinarySpectrumResult(cen, Float64(half_width_deg), phi_deg, dOmega, bands, total,
+                                     mec2 * sum(emit), mec2 * sum(esc), nz, Ntot,
+                                     sum(nrec), scattering, Float64(t_emit))
+end
+
+# Record an escaped packet into the total and the matching (band, sector)
+# spectra. Asymptotic direction k^i = g^{i nu} p_nu at the escape point, as
+# `_grmhd_escape_theta`; azimuth sector j is centred on 2 pi (j - 1) / n_phi.
+@inline function _grmhd_record_binary!(bands::Matrix{Spectrum}, total, sp::Superphoton,
+                                       st, lo, hi)
+    kcon = inverse_metric(st, sp.x) * sp.p
+    ksp = sqrt(kcon[2] * kcon[2] + kcon[3] * kcon[3] + kcon[4] * kcon[4])
+    ksp <= 0.0 && return
+    th = acos(clamp(kcon[4] / ksp, -1.0, 1.0))
+    nphi = size(bands, 2)
+    dphi = 2.0 * π / nphi
+    j = min(nphi, floor(Int, mod(atan(kcon[3], kcon[2]) + 0.5 * dphi, 2.0 * π) / dphi) + 1)
+    record_energy!(total, sp)
+    @inbounds for b in axes(bands, 1)
+        (th >= lo[b] && th <= hi[b]) && record_energy!(bands[b, j], sp)
+    end
+    return
+end
+
+"""
+    _mc_grmhd_loop!(..., model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, ...;
+                    capture_factor) -> nothing
+
+Binary version of the threaded kernel: the same chunking, seed streams and
+accumulators, with the binary trackers and recording by band and azimuth sector.
+Children take derived streams (`_mc_child_rng`).
+"""
+function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
+                         model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, zones,
+                         wgt::WeightTable,
+                         dnmax::Vector{Float64}, lint::Union{Nothing,Matrix{Float64}},
+                         offset::Vector{Int}, Ntot::Int,
+                         table::HotcrossTable,
+                         C::Float64, R_record::Float64, Rem::Float64, bias0::Float64,
+                         max_scatt::Int, scattering::Bool, seed::Int, lo, hi;
+                         capture_factor::Float64)
+    st = model.spacetime
+    nchunks = length(total_by_chunk)
+    Threads.@threads for c in 1:nchunks
+        bands = bands_by_chunk[c]
+        total = total_by_chunk[c]
+        ws = ScatterWorkspace(seed ⊻ (0x51ED9E37 * c))
+        e_emit = 0.0
+        e_esc = 0.0
+        nr = 0
+        glo = div((c - 1) * Ntot, nchunks) + 1
+        ghi = div(c * Ntot, nchunks)
+        @inbounds for gid in glo:ghi
+            z = searchsortedfirst(offset, gid) - 1        # offset[z] < gid <= offset[z+1]
+            zone = zones[z]
+            rng = MCRng(seed, gid)
+            sp, rng = sample_zone_photon(zone, wgt, dnmax[z], rng,
+                                         _zone_int_table(lint, wgt, z))
+            e_emit += sp.w * sp.E
+            if scattering
+                push_photon!(ws, sp, rng)
+                while !isempty(ws.sp)
+                    cur, crng = pop_photon!(ws)
+                    e, recorded, crng = track_superphoton_grmhd_scatter!(
+                        ws, cur, model, table, C, R_record, Rem, bias0, max_scatt, crng;
+                        capture_factor = capture_factor)
+                    if recorded
+                        e_esc += e.w * e.E
+                        nr += 1
+                        _grmhd_record_binary!(bands, total, e, st, lo, hi)
+                    end
+                end
+            else
+                e, recorded = track_superphoton_grmhd(sp, model, C, R_record, Rem;
+                                                      capture_factor = capture_factor)
+                if recorded
+                    e_esc += e.w * e.E
+                    nr += 1
+                    _grmhd_record_binary!(bands, total, e, st, lo, hi)
                 end
             end
         end
