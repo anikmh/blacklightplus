@@ -819,7 +819,8 @@ end
 # One packet's march (device twin of the binary CPU trackers). With
 # `q.scattering`, the biased Compton trigger appends children (order
 # nscatt + 1) to `out` through the atomic slot counter. Escaped packets are
-# recorded (power in acc.esc[1]).
+# recorded (power in acc.esc[1]); step-limit stops are counted with their power,
+# as on the CPU.
 @inline function _mcb_march!(acc, out, st, fl, gp, logsig, q,
                              x0::SVector{4,Float64}, p0::SVector{4,Float64}, w0::Float64,
                              tau_a0::Float64, tau_s0::Float64, nscatt::Int32, rng::MCRng)
@@ -896,6 +897,7 @@ end
         KernelAbstractions.@atomic acc.ninvalid[1] += Int64(1)
     elseif status == 3
         KernelAbstractions.@atomic acc.ncap_steps[1] += Int64(1)
+        KernelAbstractions.@atomic acc.stall_E[1] += w * (-p[1])
     end
     return nothing
 end
@@ -928,7 +930,7 @@ end
         -> GRMHDBinarySpectrumResult
 
 Device version of the binary `mc_spectrum_grmhd`, with the same keywords, physics
-(packets at the step cap are dropped, not
+(step limit, with stopped packets
 counted) and result. Seed packets are generated on the host exactly as the CPU
 driver does and tracked on `backend`; children take the same derived streams, so
 every packet draws the same random numbers as on the CPU. On the CPU backend the
@@ -949,8 +951,10 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                                R_record::Real = 1.0e3, max_scatt::Integer = 3, bias0::Real = 1.0,
                                stride::Integer = 1, max_zones::Integer = typemax(Int),
                                r_emit_max::Real = Inf, capacity_factor::Real = 0.5,
-                               workgroupsize::Integer = 64)
+                               workgroupsize::Integer = 64,
+                               max_steps::Integer = _MCM._GRMHD_MAX_STEPS)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
+    max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
     st = model.spacetime
     st.orbit isa BinaryOrbit || throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
     cf = Float64(capture_factor)
@@ -1018,9 +1022,10 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
     acc = (tot_cnt = zf(Int64, n_ebins), tot_w = zf(Float64, n_ebins), tot_wE = zf(Float64, n_ebins),
            cnt = zf(Int64, nb, nph, n_ebins), sw = zf(Float64, nb, nph, n_ebins),
            swE = zf(Float64, nb, nph, n_ebins), lo = _mcb_to(backend, lo), hi = _mcb_to(backend, hi),
-           esc = zf(Float64, 1), nrec = zf(Int64, 1), ninvalid = zf(Int64, 1), ncap_steps = zf(Int64, 1))
+           esc = zf(Float64, 1), nrec = zf(Int64, 1), ninvalid = zf(Int64, 1), ncap_steps = zf(Int64, 1),
+           stall_E = zf(Float64, 1))
     qbase = (cf = cf, C = Float64(C), R_record = Float64(R_record), Rem = Rem,
-             L_unit = model.L_unit, max_steps = _MCM._GRMHD_MAX_STEPS,
+             L_unit = model.L_unit, max_steps = Int(max_steps),
              scattering = scattering, max_scatt = Int(max_scatt), bias0 = Float64(bias0),
              lnu_min = proto.lnu_min, dlnu = proto.dlnu, n_ebins = Int(n_ebins),
              n_phi = nph, n_bands = nb)
@@ -1078,5 +1083,7 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
     phi_deg = [360.0 * (j - 1) / nph for j in 1:nph]
     return _MCM.GRMHDBinarySpectrumResult(cen, Float64(half_width_deg), phi_deg, dOmega, bands, total,
                                      emitted, mec2 * Array(acc.esc)[1], nz, Ntot,
-                                     Int(Array(acc.nrec)[1]), scattering, Float64(t_emit))
+                                     Int(Array(acc.nrec)[1]), scattering, Float64(t_emit),
+                                     Int(max_steps), Int(Array(acc.ncap_steps)[1]),
+                                     mec2 * Array(acc.stall_E)[1])
 end

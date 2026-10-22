@@ -492,17 +492,20 @@ end
 
 """
     track_superphoton_grmhd(sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
-                            C, R_record, Rem; capture_factor) -> (Superphoton, recorded::Bool)
+                            C, R_record, Rem; capture_factor, max_steps=_GRMHD_MAX_STEPS)
+        -> (Superphoton, recorded::Bool, stalled::Bool)
 
 Binary version of `track_superphoton_grmhd` (absorption only): the same march,
 forward in time through the binary metric. `recorded = true` on reaching
 `R_record` or streaming outbound past `Rem`; `false` on capture at either BH
-(`capture_factor * r_plus`, as in binary imaging) or at the step cap.
+(`capture_factor * r_plus`, as in binary imaging) or after `max_steps` steps,
+which also sets `stalled = true`.
 """
 function track_superphoton_grmhd(sph::Superphoton,
                                  model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                  C::Float64, R_record::Float64, Rem::Float64;
-                                 capture_factor::Float64)
+                                 capture_factor::Float64,
+                                 max_steps::Int = _GRMHD_MAX_STEPS)
     st = model.spacetime
     x = sph.x
     p = sph.p
@@ -514,11 +517,16 @@ function track_superphoton_grmhd(sph::Superphoton,
     na0 = _grmhd_nu_alpha(pl, p)
     r_prev = Inf
     recorded = false
-    @inbounds for _ in 1:_GRMHD_MAX_STEPS
+    stalled = true                                                # until captured / escaped
+    @inbounds for _ in 1:max_steps
         captured, r, h = _grmhd_binary_geometry(st, y, capture_factor, C)
-        captured && break                                         # captured
+        if captured                                               # captured
+            stalled = false
+            break
+        end
         if r > R_record || (r > Rem && r > r_prev)                # escaped
             recorded = true
+            stalled = false
             break
         end
         r_prev = r
@@ -535,25 +543,26 @@ function track_superphoton_grmhd(sph::Superphoton,
     sp = Superphoton(x, p, w; tau_abs = tau, tau_scatt = sph.tau_scatt,
                      nscatt = sph.nscatt, x1i = sph.x1i, x2i = sph.x2i,
                      ne0 = sph.ne0, thetae0 = sph.thetae0, b0 = sph.b0)
-    return sp, recorded
+    return sp, recorded, stalled
 end
 
 """
     track_superphoton_grmhd_scatter!(ws, sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                      table, C, R_record, Rem, bias0, max_scatt, rng;
-                                     capture_factor)
-        -> (escaped::Superphoton, recorded::Bool, rng::MCRng)
+                                     capture_factor, max_steps=_GRMHD_MAX_STEPS)
+        -> (escaped::Superphoton, recorded::Bool, stalled::Bool, rng::MCRng)
 
 Binary version of `track_superphoton_grmhd_scatter!`, on the geometry of the
-binary `track_superphoton_grmhd`. The `s`-th child along the path takes the
-stream `_mc_child_rng(rng, s)`.
+binary `track_superphoton_grmhd`; `stalled` as there. The `s`-th child along
+the path takes the stream `_mc_child_rng(rng, s)`.
 """
 function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton,
                                           model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                           table::HotcrossTable,
                                           C::Float64, R_record::Float64, Rem::Float64,
                                           bias0::Float64, max_scatt::Int, rng::MCRng;
-                                          capture_factor::Float64)
+                                          capture_factor::Float64,
+                                          max_steps::Int = _GRMHD_MAX_STEPS)
     st = model.spacetime
     x = sph.x
     p = sph.p
@@ -568,12 +577,17 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
     ns0 = _grmhd_nu_alpha_scatt(table, pl, p)
     r_prev = Inf
     recorded = false
+    stalled = true                                                # until captured / escaped
     nspawn = 0
-    @inbounds for _ in 1:_GRMHD_MAX_STEPS
+    @inbounds for _ in 1:max_steps
         captured, r, h = _grmhd_binary_geometry(st, y, capture_factor, C)
-        captured && break
+        if captured
+            stalled = false
+            break
+        end
         if r > R_record || (r > Rem && r > r_prev)
             recorded = true
+            stalled = false
             break
         end
         r_prev = r
@@ -621,7 +635,7 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
     sp = Superphoton(x, p, w; tau_abs = tau_a, tau_scatt = tau_s, nscatt = nscatt,
                      x1i = sph.x1i, x2i = sph.x2i,
                      ne0 = sph.ne0, thetae0 = sph.thetae0, b0 = sph.b0)
-    return sp, recorded, rng
+    return sp, recorded, stalled, rng
 end
 
 # ------------------------------------------------------------ result container
@@ -674,7 +688,8 @@ Output of the binary `mc_spectrum_grmhd`: as `GRMHDSpectrumResult`, with the
 escaped packets also binned in `n_phi` azimuth sectors. `spectra[k, j]` and
 `dOmega[k, j]` belong to band `incl_deg[k] +- half_width_deg` and sector `j`,
 centred on `phi_deg[j]` (sector 1 on +x, the imaging camera's azimuth). Also
-records `t_emit`.
+records `t_emit`, the step limit and the packets it stopped (`n_step_limit`,
+`step_limit_power`, in erg/s).
 """
 struct GRMHDBinarySpectrumResult
     incl_deg::Vector{Float64}
@@ -690,6 +705,9 @@ struct GRMHDBinarySpectrumResult
     n_recorded::Int
     scattering::Bool
     t_emit::Float64
+    max_steps::Int
+    n_step_limit::Int
+    step_limit_power::Float64
 end
 
 """
@@ -924,15 +942,16 @@ end
 
 """
     mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
-                      t_emit, capture_factor, C, n_phi=1, kwargs...)
+                      t_emit, capture_factor, C, n_phi=1, max_steps=_GRMHD_MAX_STEPS,
+                      kwargs...)
         -> GRMHDBinarySpectrumResult
 
 Binary version of `mc_spectrum_grmhd` (other keywords as upstream). Emitting cells
 are built at the snapshot time `t_emit`, and packets are tracked forward in time
 through the binary metric.
-Packets are captured at either BH (`capture_factor`, as in binary imaging) and
-binned by inclination and `n_phi` azimuth sectors. `C` has no default (use the
-imaging value). Children take
+Packets are captured at either BH (`capture_factor`, as in binary imaging),
+stopped after `max_steps` steps (counted) and binned by inclination and `n_phi`
+azimuth sectors. `C` has no default (use the imaging value). Children take
 derived streams (`_mc_child_rng`), so results do not depend on `nthreads`.
 """
 function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
@@ -952,8 +971,10 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                            stride::Integer = 1, max_zones::Integer = typemax(Int),
                            r_emit_max::Real = Inf,
                            table::Union{Nothing,HotcrossTable} = nothing,
-                           tabulated_gen::Bool = false)
+                           tabulated_gen::Bool = false,
+                           max_steps::Integer = _GRMHD_MAX_STEPS)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
+    max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
     cf = Float64(capture_factor)
     zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
@@ -1014,11 +1035,14 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
     emit = zeros(Float64, nchunks)
     esc = zeros(Float64, nchunks)
     nrec = zeros(Int, nchunks)
+    nstall = zeros(Int, nchunks)
+    estall = zeros(Float64, nchunks)
 
     _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     model, zones, wgt, dnmax, lint, offset, Ntot, tbl,
                     Float64(C), Float64(R_record), Rem, Float64(bias0), Int(max_scatt),
-                    scattering, Int(seed), lo, hi; capture_factor = cf)
+                    scattering, Int(seed), lo, hi; capture_factor = cf,
+                    max_steps = Int(max_steps), nstall = nstall, estall = estall)
 
     bands = mkbands()
     total = mkspec()
@@ -1031,7 +1055,8 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
     mec2 = ME * CL * CL
     return GRMHDBinarySpectrumResult(cen, Float64(half_width_deg), phi_deg, dOmega, bands, total,
                                      mec2 * sum(emit), mec2 * sum(esc), nz, Ntot,
-                                     sum(nrec), scattering, Float64(t_emit))
+                                     sum(nrec), scattering, Float64(t_emit),
+                                     Int(max_steps), sum(nstall), mec2 * sum(estall))
 end
 
 # Record an escaped packet into the total and the matching (band, sector)
@@ -1055,11 +1080,12 @@ end
 
 """
     _mc_grmhd_loop!(..., model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, ...;
-                    capture_factor) -> nothing
+                    capture_factor, max_steps, nstall, estall) -> nothing
 
 Binary version of the threaded kernel: the same chunking, seed streams and
 accumulators, with the binary trackers and recording by band and azimuth sector.
-Children take derived streams (`_mc_child_rng`).
+Children take derived streams (`_mc_child_rng`). Packets stopped by the step
+limit are counted per chunk (`nstall`/`estall`: number and Sum w E).
 """
 function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, zones,
@@ -1069,7 +1095,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          table::HotcrossTable,
                          C::Float64, R_record::Float64, Rem::Float64, bias0::Float64,
                          max_scatt::Int, scattering::Bool, seed::Int, lo, hi;
-                         capture_factor::Float64)
+                         capture_factor::Float64, max_steps::Int,
+                         nstall::Vector{Int}, estall::Vector{Float64})
     st = model.spacetime
     nchunks = length(total_by_chunk)
     Threads.@threads for c in 1:nchunks
@@ -1079,6 +1106,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         e_emit = 0.0
         e_esc = 0.0
         nr = 0
+        ns = 0
+        e_stall = 0.0
         glo = div((c - 1) * Ntot, nchunks) + 1
         ghi = div(c * Ntot, nchunks)
         @inbounds for gid in glo:ghi
@@ -1092,9 +1121,13 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                 push_photon!(ws, sp, rng)
                 while !isempty(ws.sp)
                     cur, crng = pop_photon!(ws)
-                    e, recorded, crng = track_superphoton_grmhd_scatter!(
+                    e, recorded, stalled, crng = track_superphoton_grmhd_scatter!(
                         ws, cur, model, table, C, R_record, Rem, bias0, max_scatt, crng;
-                        capture_factor = capture_factor)
+                        capture_factor = capture_factor, max_steps = max_steps)
+                    if stalled
+                        ns += 1
+                        e_stall += e.w * e.E
+                    end
                     if recorded
                         e_esc += e.w * e.E
                         nr += 1
@@ -1102,8 +1135,13 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     end
                 end
             else
-                e, recorded = track_superphoton_grmhd(sp, model, C, R_record, Rem;
-                                                      capture_factor = capture_factor)
+                e, recorded, stalled = track_superphoton_grmhd(sp, model, C, R_record, Rem;
+                                                               capture_factor = capture_factor,
+                                                               max_steps = max_steps)
+                if stalled
+                    ns += 1
+                    e_stall += e.w * e.E
+                end
                 if recorded
                     e_esc += e.w * e.E
                     nr += 1
@@ -1114,6 +1152,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         emit[c] = e_emit
         esc[c] = e_esc
         nrec[c] = nr
+        nstall[c] = ns
+        estall[c] = e_stall
     end
     return nothing
 end
