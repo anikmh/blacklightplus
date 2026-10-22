@@ -817,10 +817,10 @@ end
 end
 
 # One packet's march (device twin of the binary CPU trackers). With
-# `q.scattering`, the biased Compton trigger appends children (order
-# nscatt + 1) to `out` through the atomic slot counter. Escaped packets are
-# recorded (power in acc.esc[1]); step-limit stops are counted with their power,
-# as on the CPU.
+# `q.scattering`, the bounded-bias Compton trigger appends children (order
+# nscatt + 1) to `out` through the atomic slot counter, and packets beyond
+# `q.tau_abs_max` are dropped. Escaped packets are recorded (power in acc.esc[1]);
+# step-limit stops and absorption drops are counted with their power, as on the CPU.
 @inline function _mcb_march!(acc, out, st, fl, gp, logsig, q,
                              x0::SVector{4,Float64}, p0::SVector{4,Float64}, w0::Float64,
                              tau_a0::Float64, tau_s0::Float64, nscatt::Int32, rng::MCRng)
@@ -855,7 +855,7 @@ end
             ns1 = _mcb_nu_alpha_scatt(logsig, pln, pn)
             dtau_s = 0.5 * (ns0 + ns1) * Cgr * h
             if dtau_s > 0.0 && pln.inside && Int(nscatt) < q.max_scatt
-                b = _MCM.grmhd_bias(q.bias0, pln.theta_e, nscatt)
+                b = _MCM.grmhd_bias(q.bias0, pln.theta_e, q.theta_e2_mean, tau_s, q.bias_K)
                 spawn, weight_scat, frac, rng =
                     _MCM._mc_scatter_event(w, b, dtau_s, _MCM._MC_WEIGHT_MIN, rng)
                 if spawn
@@ -888,6 +888,10 @@ end
         tau_a += dtau_a
         tau_s += dtau_s
         y = y2; x = xn; p = pn; na0 = na1
+        if q.scattering && tau_a > q.tau_abs_max                # absorbed: drop
+            status = 5
+            break
+        end
     end
     if status == 2
         KernelAbstractions.@atomic acc.esc[1] += w * (-p[1])
@@ -898,6 +902,9 @@ end
     elseif status == 3
         KernelAbstractions.@atomic acc.ncap_steps[1] += Int64(1)
         KernelAbstractions.@atomic acc.stall_E[1] += w * (-p[1])
+    elseif status == 5
+        KernelAbstractions.@atomic acc.nacut[1] += Int64(1)
+        KernelAbstractions.@atomic acc.acut_E[1] += w * (-p[1])
     end
     return nothing
 end
@@ -930,7 +937,7 @@ end
         -> GRMHDBinarySpectrumResult
 
 Device version of the binary `mc_spectrum_grmhd`, with the same keywords, physics
-(step limit, with stopped packets
+(bounded bias, step limit and absorption cut, all
 counted) and result. Seed packets are generated on the host exactly as the CPU
 driver does and tracked on `backend`; children take the same derived streams, so
 every packet draws the same random numbers as on the CPU. On the CPU backend the
@@ -952,9 +959,12 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                                stride::Integer = 1, max_zones::Integer = typemax(Int),
                                r_emit_max::Real = Inf, capacity_factor::Real = 0.5,
                                workgroupsize::Integer = 64,
-                               max_steps::Integer = _MCM._GRMHD_MAX_STEPS)
+                               max_steps::Integer = _MCM._GRMHD_MAX_STEPS,
+                               bias_K::Real = 1.0, tau_abs_max::Real = 100.0)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
     max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
+    bias_K > 0.0 || throw(ArgumentError("bias_K must be positive"))
+    tau_abs_max > 0.0 || throw(ArgumentError("tau_abs_max must be positive"))
     st = model.spacetime
     st.orbit isa BinaryOrbit || throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
     cf = Float64(capture_factor)
@@ -992,6 +1002,15 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
     for z in zones
         Rem = max(Rem, 1.2 * sqrt(z.x[2]^2 + z.x[3]^2 + z.x[4]^2))
     end
+    # bias normalisation, exactly as the CPU driver (same summation order): the
+    # volume-averaged theta_e^2 of the emitting cells
+    sv = 0.0
+    st2 = 0.0
+    @inbounds for z in 1:nz
+        sv += zones[z].dV
+        st2 += zones[z].theta_e^2 * zones[z].dV
+    end
+    te2 = st2 / sv
 
     # ---- device data ----
     snap = model.snap
@@ -1023,10 +1042,11 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
            cnt = zf(Int64, nb, nph, n_ebins), sw = zf(Float64, nb, nph, n_ebins),
            swE = zf(Float64, nb, nph, n_ebins), lo = _mcb_to(backend, lo), hi = _mcb_to(backend, hi),
            esc = zf(Float64, 1), nrec = zf(Int64, 1), ninvalid = zf(Int64, 1), ncap_steps = zf(Int64, 1),
-           stall_E = zf(Float64, 1))
+           stall_E = zf(Float64, 1), nacut = zf(Int64, 1), acut_E = zf(Float64, 1))
     qbase = (cf = cf, C = Float64(C), R_record = Float64(R_record), Rem = Rem,
              L_unit = model.L_unit, max_steps = Int(max_steps),
              scattering = scattering, max_scatt = Int(max_scatt), bias0 = Float64(bias0),
+             theta_e2_mean = te2, bias_K = Float64(bias_K), tau_abs_max = Float64(tau_abs_max),
              lnu_min = proto.lnu_min, dlnu = proto.dlnu, n_ebins = Int(n_ebins),
              n_phi = nph, n_bands = nb)
 
@@ -1085,5 +1105,7 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                                      emitted, mec2 * Array(acc.esc)[1], nz, Ntot,
                                      Int(Array(acc.nrec)[1]), scattering, Float64(t_emit),
                                      Int(max_steps), Int(Array(acc.ncap_steps)[1]),
-                                     mec2 * Array(acc.stall_E)[1])
+                                     mec2 * Array(acc.stall_E)[1],
+                                     te2, Float64(bias_K), Float64(tau_abs_max),
+                                     Int(Array(acc.nacut)[1]), mec2 * Array(acc.acut_E)[1])
 end

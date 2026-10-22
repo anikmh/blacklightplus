@@ -290,6 +290,23 @@ reweighted `w(1-e^{-dtau_s})/(1-e^{-b dtau_s})`, see `_mc_scatter_event`).
 @inline grmhd_bias(bias0::Real, theta_e::Real, nscatt::Integer) =
     max(1.0, Float64(bias0) * (Float64(nscatt) + 1.0)^2)
 
+"""
+    grmhd_bias(bias0, theta_e, theta_e2_mean, tau_s_cum, K) -> Float64
+
+Bounded importance bias of the binary scattering tracker:
+`b = max(1, min(bias0 theta_e^2 / theta_e2_mean, K / tau_s_cum))`. The
+`theta_e^2` weighting follows grmonty `bias_func`; capping by the scattering depth
+`tau_s_cum` already crossed (ancestors included) keeps the expected number of
+children per lineage ~ `K ln(tau_s)`, where the order-growing 3-argument form can
+run away. Unbiased for any `b >= 1` (see `_mc_scatter_event`).
+"""
+@inline function grmhd_bias(bias0::Real, theta_e::Real, theta_e2_mean::Real,
+                            tau_s_cum::Real, K::Real)
+    b = Float64(bias0) * Float64(theta_e)^2 / Float64(theta_e2_mean)
+    tau_s_cum > 0.0 && (b = min(b, Float64(K) / Float64(tau_s_cum)))
+    return max(1.0, b)
+end
+
 # Escaped-photon polar angle [rad] in [0, pi] about the spin (z) axis, from the
 # ASYMPTOTIC contravariant direction k^mu = g^{mu nu} p_nu at the escape point
 # (KS -> flat there, so k^i is the travel direction). NOT folded (i = 17 and 163 deg
@@ -549,12 +566,15 @@ end
 """
     track_superphoton_grmhd_scatter!(ws, sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                      table, C, R_record, Rem, bias0, max_scatt, rng;
-                                     capture_factor, max_steps=_GRMHD_MAX_STEPS)
+                                     capture_factor, max_steps=_GRMHD_MAX_STEPS,
+                                     theta_e2_mean=1.0, bias_K=1.0, tau_abs_max=100.0)
         -> (escaped::Superphoton, recorded::Bool, stalled::Bool, rng::MCRng)
 
 Binary version of `track_superphoton_grmhd_scatter!`, on the geometry of the
-binary `track_superphoton_grmhd`; `stalled` as there. The `s`-th child along
-the path takes the stream `_mc_child_rng(rng, s)`.
+binary `track_superphoton_grmhd` and with the bounded bias
+`grmhd_bias(bias0, theta_e, theta_e2_mean, tau_s, bias_K)`. The `s`-th child
+along the path takes the stream `_mc_child_rng(rng, s)`. A packet whose absorption
+depth exceeds `tau_abs_max` is dropped (`recorded = stalled = false`), as in grmonty.
 """
 function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton,
                                           model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
@@ -562,7 +582,10 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
                                           C::Float64, R_record::Float64, Rem::Float64,
                                           bias0::Float64, max_scatt::Int, rng::MCRng;
                                           capture_factor::Float64,
-                                          max_steps::Int = _GRMHD_MAX_STEPS)
+                                          max_steps::Int = _GRMHD_MAX_STEPS,
+                                          theta_e2_mean::Float64 = 1.0,
+                                          bias_K::Float64 = 1.0,
+                                          tau_abs_max::Float64 = 100.0)
     st = model.spacetime
     x = sph.x
     p = sph.p
@@ -602,7 +625,7 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
 
         # ---- biased scatter decision (shared exponential transform) ----------
         if dtau_s > 0.0 && pln.inside && Int(nscatt) < max_scatt
-            b = grmhd_bias(bias0, pln.theta_e, nscatt)
+            b = grmhd_bias(bias0, pln.theta_e, theta_e2_mean, tau_s, bias_K)
             spawn, weight_scat, frac, rng =
                 _mc_scatter_event(w, b, dtau_s, _MC_WEIGHT_MIN, rng)
             if spawn
@@ -631,6 +654,10 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
         tau_a += dtau_a
         tau_s += dtau_s
         y = y2; x = xn; p = pn; na0 = na1; ns0 = ns1
+        if tau_a > tau_abs_max                                    # absorbed: drop
+            stalled = false
+            break
+        end
     end
     sp = Superphoton(x, p, w; tau_abs = tau_a, tau_scatt = tau_s, nscatt = nscatt,
                      x1i = sph.x1i, x2i = sph.x2i,
@@ -689,7 +716,8 @@ escaped packets also binned in `n_phi` azimuth sectors. `spectra[k, j]` and
 `dOmega[k, j]` belong to band `incl_deg[k] +- half_width_deg` and sector `j`,
 centred on `phi_deg[j]` (sector 1 on +x, the imaging camera's azimuth). Also
 records `t_emit`, the step limit and the packets it stopped (`n_step_limit`,
-`step_limit_power`, in erg/s).
+`step_limit_power`), the bias normalisation (`theta_e2_mean`, `bias_K`) and the
+packets dropped beyond `tau_abs_max` (`n_abs_cut`, `abs_cut_power`; powers in erg/s).
 """
 struct GRMHDBinarySpectrumResult
     incl_deg::Vector{Float64}
@@ -708,6 +736,11 @@ struct GRMHDBinarySpectrumResult
     max_steps::Int
     n_step_limit::Int
     step_limit_power::Float64
+    theta_e2_mean::Float64
+    bias_K::Float64
+    tau_abs_max::Float64
+    n_abs_cut::Int
+    abs_cut_power::Float64
 end
 
 """
@@ -943,7 +976,7 @@ end
 """
     mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
                       t_emit, capture_factor, C, n_phi=1, max_steps=_GRMHD_MAX_STEPS,
-                      kwargs...)
+                      bias_K=1.0, tau_abs_max=100.0, kwargs...)
         -> GRMHDBinarySpectrumResult
 
 Binary version of `mc_spectrum_grmhd` (other keywords as upstream). Emitting cells
@@ -951,7 +984,10 @@ are built at the snapshot time `t_emit`, and packets are tracked forward in time
 through the binary metric.
 Packets are captured at either BH (`capture_factor`, as in binary imaging),
 stopped after `max_steps` steps (counted) and binned by inclination and `n_phi`
-azimuth sectors. `C` has no default (use the imaging value). Children take
+azimuth sectors. `C` has no default (use the imaging value). With scattering,
+`bias0` is the bias for gas at the volume-averaged `theta_e^2` of the emitting
+cells, capped at `bias_K / tau_s` (5-argument `grmhd_bias`); packets beyond
+`tau_abs_max` are dropped and counted. Children take
 derived streams (`_mc_child_rng`), so results do not depend on `nthreads`.
 """
 function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
@@ -972,9 +1008,12 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                            r_emit_max::Real = Inf,
                            table::Union{Nothing,HotcrossTable} = nothing,
                            tabulated_gen::Bool = false,
-                           max_steps::Integer = _GRMHD_MAX_STEPS)
+                           max_steps::Integer = _GRMHD_MAX_STEPS,
+                           bias_K::Real = 1.0, tau_abs_max::Real = 100.0)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
     max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
+    bias_K > 0.0 || throw(ArgumentError("bias_K must be positive"))
+    tau_abs_max > 0.0 || throw(ArgumentError("tau_abs_max must be positive"))
     cf = Float64(capture_factor)
     zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
@@ -1026,6 +1065,16 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
         Rem = max(Rem, 1.2 * sqrt(x[2] * x[2] + x[3] * x[3] + x[4] * x[4]))
     end
 
+    # bias normalisation: the volume-averaged theta_e^2 of the emitting cells
+    # (grmonty bias_norm)
+    sv = 0.0
+    st2 = 0.0
+    @inbounds for z in 1:nz
+        sv += zones[z].dV
+        st2 += zones[z].theta_e^2 * zones[z].dV
+    end
+    te2 = st2 / sv
+
     nchunks = max(1, Int(nthreads))
     mkspec() = Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max,
                         n_ebins = n_ebins, n_thbins = 1)
@@ -1037,12 +1086,16 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
     nrec = zeros(Int, nchunks)
     nstall = zeros(Int, nchunks)
     estall = zeros(Float64, nchunks)
+    nacut = zeros(Int, nchunks)
+    eacut = zeros(Float64, nchunks)
 
     _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     model, zones, wgt, dnmax, lint, offset, Ntot, tbl,
                     Float64(C), Float64(R_record), Rem, Float64(bias0), Int(max_scatt),
                     scattering, Int(seed), lo, hi; capture_factor = cf,
-                    max_steps = Int(max_steps), nstall = nstall, estall = estall)
+                    max_steps = Int(max_steps), nstall = nstall, estall = estall,
+                    theta_e2_mean = te2, bias_K = Float64(bias_K),
+                    tau_abs_max = Float64(tau_abs_max), nacut = nacut, eacut = eacut)
 
     bands = mkbands()
     total = mkspec()
@@ -1056,7 +1109,9 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
     return GRMHDBinarySpectrumResult(cen, Float64(half_width_deg), phi_deg, dOmega, bands, total,
                                      mec2 * sum(emit), mec2 * sum(esc), nz, Ntot,
                                      sum(nrec), scattering, Float64(t_emit),
-                                     Int(max_steps), sum(nstall), mec2 * sum(estall))
+                                     Int(max_steps), sum(nstall), mec2 * sum(estall),
+                                     te2, Float64(bias_K), Float64(tau_abs_max),
+                                     sum(nacut), mec2 * sum(eacut))
 end
 
 # Record an escaped packet into the total and the matching (band, sector)
@@ -1080,12 +1135,14 @@ end
 
 """
     _mc_grmhd_loop!(..., model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, ...;
-                    capture_factor, max_steps, nstall, estall) -> nothing
+                    capture_factor, max_steps, nstall, estall,
+                    theta_e2_mean, bias_K, tau_abs_max, nacut, eacut) -> nothing
 
 Binary version of the threaded kernel: the same chunking, seed streams and
 accumulators, with the binary trackers and recording by band and azimuth sector.
 Children take derived streams (`_mc_child_rng`). Packets stopped by the step
-limit are counted per chunk (`nstall`/`estall`: number and Sum w E).
+limit and dropped by the absorption cut are counted per chunk (`nstall`/`estall`,
+`nacut`/`eacut`: number and Sum w E).
 """
 function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, zones,
@@ -1096,7 +1153,9 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          C::Float64, R_record::Float64, Rem::Float64, bias0::Float64,
                          max_scatt::Int, scattering::Bool, seed::Int, lo, hi;
                          capture_factor::Float64, max_steps::Int,
-                         nstall::Vector{Int}, estall::Vector{Float64})
+                         nstall::Vector{Int}, estall::Vector{Float64},
+                         theta_e2_mean::Float64, bias_K::Float64, tau_abs_max::Float64,
+                         nacut::Vector{Int}, eacut::Vector{Float64})
     st = model.spacetime
     nchunks = length(total_by_chunk)
     Threads.@threads for c in 1:nchunks
@@ -1108,6 +1167,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         nr = 0
         ns = 0
         e_stall = 0.0
+        na = 0
+        e_acut = 0.0
         glo = div((c - 1) * Ntot, nchunks) + 1
         ghi = div(c * Ntot, nchunks)
         @inbounds for gid in glo:ghi
@@ -1123,10 +1184,15 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     cur, crng = pop_photon!(ws)
                     e, recorded, stalled, crng = track_superphoton_grmhd_scatter!(
                         ws, cur, model, table, C, R_record, Rem, bias0, max_scatt, crng;
-                        capture_factor = capture_factor, max_steps = max_steps)
+                        capture_factor = capture_factor, max_steps = max_steps,
+                        theta_e2_mean = theta_e2_mean, bias_K = bias_K,
+                        tau_abs_max = tau_abs_max)
                     if stalled
                         ns += 1
                         e_stall += e.w * e.E
+                    elseif !recorded && e.tau_abs > tau_abs_max
+                        na += 1
+                        e_acut += e.w * e.E
                     end
                     if recorded
                         e_esc += e.w * e.E
@@ -1154,6 +1220,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         nrec[c] = nr
         nstall[c] = ns
         estall[c] = e_stall
+        nacut[c] = na
+        eacut[c] = e_acut
     end
     return nothing
 end
