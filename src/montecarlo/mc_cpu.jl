@@ -449,6 +449,181 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
     return sp, recorded, rng
 end
 
+# ------------------------------------------------------------ binary trackers
+#
+# Same transport as the single-BH trackers above (fixed-step RK4 along the
+# null geodesic, trapezoid absorption depth, biased Compton trigger), with the
+# geometry of the time-dependent binary metric taken from binary imaging
+# (`trace_rays_sampled` for `SuperposedBoostedKerrSchildCartesian`, spacetimes.jl):
+#   - capture at either moving BH: rest-frame KS radius <= capture_factor * r_plus
+#     (+ HORIZON_EPS_SAMPLED), via `Geodesics._sbks_trace_geometry`;
+#   - step: coordinate displacement ~ min(d_min / C, 1) with d_min the smallest
+#     distance to an individual horizon, h = that / max(|dt/dl|, |dx/dl|);
+#   - escape on the coordinate distance R from the origin (no single KS radius).
+# Packets move forward in coordinate time (h > 0) from the emission time.
+
+# Largest coordinate displacement per step, as in binary imaging
+# (`trace_rays_sampled` default `max_coord_step = 1.0`; GPU kernel `min(dmin / C, 1.0)`).
+const _GRMHD_BINARY_MAX_COORD_STEP = 1.0
+
+"""
+    _grmhd_binary_geometry(st, y, capture_factor, C) -> (captured::Bool, R, h)
+
+Binary geometry for one tracker step at state `y = (x^mu, p_mu)`: capture flag
+at either BH, coordinate distance `R` from the origin, and the affine step `h`
+(positive, forward in time) that moves the packet by at most
+`min(d_min / C, 1)` in any coordinate. Raises on invalid geometry, on a
+past-directed packet (`dt/dl <= 0`) or a non-finite step, as binary imaging does.
+"""
+@inline function _grmhd_binary_geometry(st::SuperposedBoostedKerrSchildCartesian,
+                                        y::SVector{8,Float64},
+                                        capture_factor::Float64, C::Float64)
+    x = SVector(y[1], y[2], y[3], y[4])
+    ctl = Geodesics._sbks_trace_geometry(st, x, capture_factor)
+    ctl.valid || error("binary MC tracker: invalid binary geometry at t = $(x[1])")
+    ctl.captured && return (true, ctl.R, 0.0)
+    rhs = geodesic_rhs(st, y)
+    rhs[1] > 0.0 || error("binary MC tracker: packet is not future directed (dt/dl = $(rhs[1]))")
+    rate = max(abs(rhs[1]), sqrt(rhs[2] * rhs[2] + rhs[3] * rhs[3] + rhs[4] * rhs[4]))
+    h = min(ctl.dmin / C, _GRMHD_BINARY_MAX_COORD_STEP) / rate
+    (isfinite(h) && h > 0.0) || error("binary MC tracker: invalid affine step $h")
+    return (false, ctl.R, h)
+end
+
+"""
+    track_superphoton_grmhd(sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
+                            C, R_record, Rem; capture_factor) -> (Superphoton, recorded::Bool)
+
+Binary version of `track_superphoton_grmhd` (absorption only): the same march,
+forward in time through the binary metric. `recorded = true` on reaching
+`R_record` or streaming outbound past `Rem`; `false` on capture at either BH
+(`capture_factor * r_plus`, as in binary imaging) or at the step cap.
+"""
+function track_superphoton_grmhd(sph::Superphoton,
+                                 model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
+                                 C::Float64, R_record::Float64, Rem::Float64;
+                                 capture_factor::Float64)
+    st = model.spacetime
+    x = sph.x
+    p = sph.p
+    w = sph.w
+    tau = sph.tau_abs
+    y = SVector(x[1], x[2], x[3], x[4], p[1], p[2], p[3], p[4])
+    Cgr = model.L_unit * HPL / (ME * CL * CL)
+    pl = plasma_at(model, x)
+    na0 = _grmhd_nu_alpha(pl, p)
+    r_prev = Inf
+    recorded = false
+    @inbounds for _ in 1:_GRMHD_MAX_STEPS
+        captured, r, h = _grmhd_binary_geometry(st, y, capture_factor, C)
+        captured && break                                         # captured
+        if r > R_record || (r > Rem && r > r_prev)                # escaped
+            recorded = true
+            break
+        end
+        r_prev = r
+        y = rk4_step_fixed(st, y, h)
+        xn = SVector(y[1], y[2], y[3], y[4])
+        pn = SVector(y[5], y[6], y[7], y[8])
+        pln = plasma_at(model, xn)
+        na1 = _grmhd_nu_alpha(pln, pn)
+        dtau = 0.5 * (na0 + na1) * Cgr * h
+        tau += dtau
+        w *= exp(-dtau)
+        x = xn; p = pn; na0 = na1
+    end
+    sp = Superphoton(x, p, w; tau_abs = tau, tau_scatt = sph.tau_scatt,
+                     nscatt = sph.nscatt, x1i = sph.x1i, x2i = sph.x2i,
+                     ne0 = sph.ne0, thetae0 = sph.thetae0, b0 = sph.b0)
+    return sp, recorded
+end
+
+"""
+    track_superphoton_grmhd_scatter!(ws, sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
+                                     table, C, R_record, Rem, bias0, max_scatt, rng;
+                                     capture_factor)
+        -> (escaped::Superphoton, recorded::Bool, rng::MCRng)
+
+Binary version of `track_superphoton_grmhd_scatter!`, on the geometry of the
+binary `track_superphoton_grmhd`. The `s`-th child along the path takes the
+stream `_mc_child_rng(rng, s)`.
+"""
+function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton,
+                                          model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
+                                          table::HotcrossTable,
+                                          C::Float64, R_record::Float64, Rem::Float64,
+                                          bias0::Float64, max_scatt::Int, rng::MCRng;
+                                          capture_factor::Float64)
+    st = model.spacetime
+    x = sph.x
+    p = sph.p
+    w = sph.w
+    tau_a = sph.tau_abs
+    tau_s = sph.tau_scatt
+    nscatt = sph.nscatt
+    y = SVector(x[1], x[2], x[3], x[4], p[1], p[2], p[3], p[4])
+    Cgr = model.L_unit * HPL / (ME * CL * CL)
+    pl = plasma_at(model, x)
+    na0 = _grmhd_nu_alpha(pl, p)
+    ns0 = _grmhd_nu_alpha_scatt(table, pl, p)
+    r_prev = Inf
+    recorded = false
+    nspawn = 0
+    @inbounds for _ in 1:_GRMHD_MAX_STEPS
+        captured, r, h = _grmhd_binary_geometry(st, y, capture_factor, C)
+        captured && break
+        if r > R_record || (r > Rem && r > r_prev)
+            recorded = true
+            break
+        end
+        r_prev = r
+        y2 = rk4_step_fixed(st, y, h)
+        xn = SVector(y2[1], y2[2], y2[3], y2[4])
+        pn = SVector(y2[5], y2[6], y2[7], y2[8])
+        pln = plasma_at(model, xn)
+        na1 = _grmhd_nu_alpha(pln, pn)
+        ns1 = _grmhd_nu_alpha_scatt(table, pln, pn)
+        dtau_a = 0.5 * (na0 + na1) * Cgr * h
+        dtau_s = 0.5 * (ns0 + ns1) * Cgr * h
+
+        # ---- biased scatter decision (shared exponential transform) ----------
+        if dtau_s > 0.0 && pln.inside && Int(nscatt) < max_scatt
+            b = grmhd_bias(bias0, pln.theta_e, nscatt)
+            spawn, weight_scat, frac, rng =
+                _mc_scatter_event(w, b, dtau_s, _MC_WEIGHT_MIN, rng)
+            if spawn
+                yev = rk4_step_fixed(st, y, h * frac)             # event point in-step
+                xev = SVector(yev[1], yev[2], yev[3], yev[4])
+                pev = SVector(yev[5], yev[6], yev[7], yev[8])
+                plev = plasma_at(model, xev)
+                if plev.inside
+                    p_new, _, rng = scatter_superphoton(pev, plev.ucon, plev.ucov,
+                                                        plev.bcon, plev.theta_e,
+                                                        plev.gcov, plev.gcon, rng)
+                    w_child = weight_scat * exp(-dtau_a * frac)   # absorbed up to event
+                    child = Superphoton(xev, p_new, w_child;
+                                        tau_abs = tau_a, tau_scatt = tau_s,
+                                        nscatt = nscatt + Int32(1),
+                                        x1i = sph.x1i, x2i = sph.x2i,
+                                        ne0 = sph.ne0, thetae0 = sph.thetae0, b0 = sph.b0)
+                    nspawn += 1
+                    _spawn_child!(ws, child, _mc_child_rng(rng, nspawn))
+                end
+            end
+        end
+
+        # ---- physical depletion of the incident beam ------------------------
+        w *= exp(-(dtau_a + dtau_s))
+        tau_a += dtau_a
+        tau_s += dtau_s
+        y = y2; x = xn; p = pn; na0 = na1; ns0 = ns1
+    end
+    sp = Superphoton(x, p, w; tau_abs = tau_a, tau_scatt = tau_s, nscatt = nscatt,
+                     x1i = sph.x1i, x2i = sph.x2i,
+                     ne0 = sph.ne0, thetae0 = sph.thetae0, b0 = sph.b0)
+    return sp, recorded, rng
+end
+
 # ------------------------------------------------------------ result container
 
 """
