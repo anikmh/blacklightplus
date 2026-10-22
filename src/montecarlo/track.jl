@@ -185,6 +185,16 @@ end
     return ws
 end
 
+# Spawn a scattered child on a given stream (e.g. derived from its parent's with
+# `_mc_child_rng`), accumulating the same diagnostics.
+@inline function _spawn_child!(ws::ScatterWorkspace, child::Superphoton, rng::MCRng)
+    push_photon!(ws, child, rng)
+    ws.child_weight += child.w
+    child.nscatt == Int32(1) && (ws.first_order_weight += child.w)
+    ws.n_children += 1
+    return ws
+end
+
 """
     track_superphoton_scatter!(ws, sph, model, table, rng; max_scatt)
         -> (escaped::Superphoton, recorded::Bool, scatter_loss::Float64, rng::MCRng)

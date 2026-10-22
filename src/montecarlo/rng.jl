@@ -88,6 +88,23 @@ end
 @inline MCRng(global_seed::Integer, stream_id::Integer, ctr::Integer = 0) =
     MCRng((UInt32(global_seed & 0xffffffff), UInt32(stream_id & 0xffffffff)), UInt32(ctr))
 
+# Philox counter word that separates child-key derivation from a stream's own
+# draws (those use counters (n, 0, 0, 0)); ASCII "CHLD".
+const _MC_CHILD_KEY_TAG = 0x43484C44
+
+"""
+    _mc_child_rng(parent::MCRng, s::Integer) -> MCRng
+
+Stream of the `s`-th Compton child spawned along the path of `parent`'s packet:
+key = two words of `philox4x32((s, tag, 0, 0), parent.key)`, counter 0 (as
+Cuneo & Variansyah 2024, arXiv:2403.06362). Independent of the parent's draw
+count, thread layout and device, so CPU and GPU give each child the same stream.
+"""
+@inline function _mc_child_rng(parent::MCRng, s::Integer)
+    c = philox4x32((UInt32(s), _MC_CHILD_KEY_TAG, 0x00000000, 0x00000000), parent.key)
+    return MCRng((c[1], c[2]), 0x00000000)
+end
+
 """
     mc_uniform(rng) -> (Float64 in [0,1), MCRng)
 
