@@ -180,3 +180,83 @@ function emission_zones(model::GRMHDModel; max_zones::Integer = typemax(Int),
     end
     return zones
 end
+
+# ================================================================ binary model
+
+"""
+    GRMHDModel(snap::AthenaKSnapshot, st::SuperposedBoostedKerrSchildCartesian,
+               cfg::SimCoeffConfig; m_bh_cgs, R_em) -> GRMHDModel
+
+Monte Carlo model for an Athena++ binary snapshot in the binary metric `st`. Pass
+the snapshot and plasma configuration exactly as for binary imaging (internal
+energy converted to `cfg.plasma_gamma`; `cfg` from `_prepared_scc`), so the Monte
+Carlo sees the same plasma as the images. `m_bh_cgs` is the primary mass M1 [g]
+and sets `L_unit = G M1 / c^2`; `r_h` is `NaN` (the binary methods capture at
+either BH).
+"""
+function GRMHDModel(snap::AthenaKSnapshot, st::SuperposedBoostedKerrSchildCartesian,
+                    cfg::SimCoeffConfig; m_bh_cgs::Real, R_em::Real)
+    m = Float64(m_bh_cgs)
+    m > 0.0 || throw(ArgumentError("m_bh_cgs must be positive"))
+    L_unit = GNEWT * m / CL^2
+    return GRMHDModel(st, snap, cfg, Float64(cfg.plasma_gamma), L_unit,
+                      NaN, Float64(R_em))
+end
+
+"""
+    emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};
+                   t_emit, capture_factor, max_zones=typemax(Int), stride=1,
+                   r_emit_max=Inf) -> Vector{EmissionZone}
+
+Binary version of `emission_zones`. Emitting cells are placed at the coordinate
+time `t_emit` (the snapshot time), where the orbit, the metric, the fluid
+four-vectors and the proper volume `dV = sqrt(-g) dx1 dx2 dx3 L_unit^3` are
+evaluated. Cells inside either BH's capture boundary
+(`capture_factor * r_plus`, as in binary imaging) are skipped, because their
+photons are captured at once. `r_emit_max` caps the coordinate distance from
+the origin (the binary's centre of mass), since `ks_radius` has no meaning here.
+`stride`, `max_zones` and the finest-block de-duplication are as upstream.
+"""
+function emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};
+                        t_emit::Real, capture_factor::Real,
+                        max_zones::Integer = typemax(Int),
+                        stride::Integer = 1, r_emit_max::Real = Inf)
+    snap = model.snap
+    st = model.spacetime
+    t = Float64(t_emit)
+    cf = Float64(capture_factor)
+    isfinite(t) || throw(ArgumentError("t_emit must be finite"))
+    isfinite(cf) && cf >= 1.0 ||
+        throw(ArgumentError("capture_factor must be finite and at least 1"))
+    rmax = Float64(r_emit_max)
+    zones = EmissionZone[]
+    s3 = Float64(stride)^3
+    Lu3 = model.L_unit^3
+    @inbounds for mb in 1:snap.nmb
+        xl = snap.x_left[mb]
+        dxb = snap.dx[mb]
+        dVcode = dxb[1] * dxb[2] * dxb[3] * s3
+        for k in 1:stride:snap.nk, j in 1:stride:snap.nj, i in 1:stride:snap.ni
+            xx = xl[1] + (i - 1) * dxb[1]
+            yy = xl[2] + (j - 1) * dxb[2]
+            zz = xl[3] + (k - 1) * dxb[3]
+            _owner_block(snap, xx, yy, zz) == mb || continue      # finest-block only
+            sqrt(xx * xx + yy * yy + zz * zz) <= rmax || continue  # luminous-region cap
+            xc = SVector(t, xx, yy, zz)
+            ctl = Geodesics._sbks_trace_geometry(st, xc, cf)
+            ctl.valid || error("emission_zones: invalid binary geometry at $xc")
+            ctl.captured && continue                              # inside a capture boundary
+            pl = plasma_at(model, xc)
+            (pl.inside && pl.n_e > 0.0 && pl.theta_e > 0.0) || continue
+            g = pl.gcov
+            detg = det(g)
+            detg < 0.0 || error("emission_zones: det(g) = $detg >= 0 at $xc")
+            dV = sqrt(-detg) * dVcode * Lu3
+            push!(zones, EmissionZone(n_e = pl.n_e, theta_e = pl.theta_e, B = pl.B,
+                                      dV = dV, x = xc, ucon = pl.ucon, ucov = pl.ucov,
+                                      bcon = pl.bcon, gcov = g, gcon = pl.gcon))
+            length(zones) >= max_zones && return zones
+        end
+    end
+    return zones
+end
