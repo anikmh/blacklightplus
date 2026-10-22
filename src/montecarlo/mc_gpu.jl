@@ -960,11 +960,14 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                                r_emit_max::Real = Inf, capacity_factor::Real = 0.5,
                                workgroupsize::Integer = 64,
                                max_steps::Integer = _MCM._GRMHD_MAX_STEPS,
-                               bias_K::Real = 1.0, tau_abs_max::Real = 100.0)
+                               bias_K::Real = 1.0, tau_abs_max::Real = 100.0,
+                               theta_e2_ref::Union{Nothing,Real} = nothing)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
     max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
     bias_K > 0.0 || throw(ArgumentError("bias_K must be positive"))
     tau_abs_max > 0.0 || throw(ArgumentError("tau_abs_max must be positive"))
+    theta_e2_ref === nothing || theta_e2_ref > 0.0 ||
+        throw(ArgumentError("theta_e2_ref must be positive"))
     st = model.spacetime
     st.orbit isa BinaryOrbit || throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
     cf = Float64(capture_factor)
@@ -1002,15 +1005,19 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
     for z in zones
         Rem = max(Rem, 1.2 * sqrt(z.x[2]^2 + z.x[3]^2 + z.x[4]^2))
     end
-    # bias normalisation, exactly as the CPU driver (same summation order): the
-    # volume-averaged theta_e^2 of the emitting cells
-    sv = 0.0
-    st2 = 0.0
-    @inbounds for z in 1:nz
-        sv += zones[z].dV
-        st2 += zones[z].theta_e^2 * zones[z].dV
+    # bias normalisation, exactly as the CPU driver (same summation order):
+    # theta_e2_ref if given, else the volume-averaged theta_e^2 of the emitting cells
+    if theta_e2_ref === nothing
+        sv = 0.0
+        st2 = 0.0
+        @inbounds for z in 1:nz
+            sv += zones[z].dV
+            st2 += zones[z].theta_e^2 * zones[z].dV
+        end
+        te2 = st2 / sv
+    else
+        te2 = Float64(theta_e2_ref)
     end
-    te2 = st2 / sv
 
     # ---- device data ----
     snap = model.snap

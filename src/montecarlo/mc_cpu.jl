@@ -976,7 +976,7 @@ end
 """
     mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
                       t_emit, capture_factor, C, n_phi=1, max_steps=_GRMHD_MAX_STEPS,
-                      bias_K=1.0, tau_abs_max=100.0, kwargs...)
+                      bias_K=1.0, tau_abs_max=100.0, theta_e2_ref=nothing, kwargs...)
         -> GRMHDBinarySpectrumResult
 
 Binary version of `mc_spectrum_grmhd` (other keywords as upstream). Emitting cells
@@ -985,9 +985,9 @@ through the binary metric.
 Packets are captured at either BH (`capture_factor`, as in binary imaging),
 stopped after `max_steps` steps (counted) and binned by inclination and `n_phi`
 azimuth sectors. `C` has no default (use the imaging value). With scattering,
-`bias0` is the bias for gas at the volume-averaged `theta_e^2` of the emitting
-cells, capped at `bias_K / tau_s` (5-argument `grmhd_bias`); packets beyond
-`tau_abs_max` are dropped and counted. Children take
+`bias0` is the bias for gas at `theta_e^2 = theta_e2_ref` (default: the volume
+average over the emitting cells), capped at `bias_K / tau_s` (5-argument
+`grmhd_bias`); packets beyond `tau_abs_max` are dropped and counted. Children take
 derived streams (`_mc_child_rng`), so results do not depend on `nthreads`.
 """
 function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
@@ -1009,11 +1009,14 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                            table::Union{Nothing,HotcrossTable} = nothing,
                            tabulated_gen::Bool = false,
                            max_steps::Integer = _GRMHD_MAX_STEPS,
-                           bias_K::Real = 1.0, tau_abs_max::Real = 100.0)
+                           bias_K::Real = 1.0, tau_abs_max::Real = 100.0,
+                           theta_e2_ref::Union{Nothing,Real} = nothing)
     n_phi >= 1 || throw(ArgumentError("n_phi must be at least 1"))
     max_steps >= 1 || throw(ArgumentError("max_steps must be at least 1"))
     bias_K > 0.0 || throw(ArgumentError("bias_K must be positive"))
     tau_abs_max > 0.0 || throw(ArgumentError("tau_abs_max must be positive"))
+    theta_e2_ref === nothing || theta_e2_ref > 0.0 ||
+        throw(ArgumentError("theta_e2_ref must be positive"))
     cf = Float64(capture_factor)
     zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
@@ -1065,15 +1068,19 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
         Rem = max(Rem, 1.2 * sqrt(x[2] * x[2] + x[3] * x[3] + x[4] * x[4]))
     end
 
-    # bias normalisation: the volume-averaged theta_e^2 of the emitting cells
-    # (grmonty bias_norm)
-    sv = 0.0
-    st2 = 0.0
-    @inbounds for z in 1:nz
-        sv += zones[z].dV
-        st2 += zones[z].theta_e^2 * zones[z].dV
+    # bias normalisation: theta_e2_ref if given, else the volume-averaged theta_e^2 of
+    # the emitting cells (grmonty bias_norm)
+    if theta_e2_ref === nothing
+        sv = 0.0
+        st2 = 0.0
+        @inbounds for z in 1:nz
+            sv += zones[z].dV
+            st2 += zones[z].theta_e^2 * zones[z].dV
+        end
+        te2 = st2 / sv
+    else
+        te2 = Float64(theta_e2_ref)
     end
-    te2 = st2 / sv
 
     nchunks = max(1, Int(nthreads))
     mkspec() = Spectrum(; nu_min = spec_nu_min, nu_max = spec_nu_max,
