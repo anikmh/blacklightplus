@@ -778,9 +778,9 @@ end
 
 # Device binary geometry (CPU `_grmhd_binary_geometry` without `error`):
 # status 0 = step, 1 = captured, 4 = invalid.
-@inline function _mcb_geometry(st, y::SVector{8,Float64}, cf::Float64, C::Float64)
+@inline function _mcb_geometry(st, y::SVector{8,Float64}, C::Float64)
     x = SVector(y[1], y[2], y[3], y[4])
-    ctl = _MCB_G._sbks_trace_geometry(st, x, cf)
+    ctl = _MCB_G._sbks_trace_geometry(st, x)
     ctl.valid || return (4, 0.0, 0.0)
     ctl.captured && return (1, ctl.R, 0.0)
     rhs = _MCB_G.geodesic_rhs(st, y)
@@ -835,7 +835,7 @@ end
     status = 3
     nspawn = 0
     for _ in 1:q.max_steps
-        s, r, h = _mcb_geometry(st, y, q.cf, q.C)
+        s, r, h = _mcb_geometry(st, y, q.C)
         if s != 0
             status = s
             break
@@ -933,7 +933,7 @@ end
 
 """
     mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns;
-                          t_emit, capture_factor, C, backend=CUDABackend(),
+                          t_emit, C, backend=CUDABackend(),
                           capacity_factor=0.5, workgroupsize=64, kwargs...)
         -> GRMHDBinarySpectrumResult
 
@@ -948,7 +948,7 @@ scattering order's child buffer relative to its parent count; an overflow raises
 an error. Load after `using BlackLightPlus` (and `using CUDA` for `CUDABackend()`).
 """
 function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, Ns::Real;
-                               t_emit::Real, capture_factor::Real, C::Real,
+                               t_emit::Real, C::Real,
                                backend = CUDABackend(),
                                n_phi::Integer = 1, scattering::Bool = true,
                                seed::Integer = 0x51EED5,
@@ -971,10 +971,9 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
         throw(ArgumentError("theta_e2_ref must be positive"))
     st = model.spacetime
     st.orbit isa BinaryOrbit || throw(ArgumentError("pass a CPU metric containing a BinaryOrbit"))
-    cf = Float64(capture_factor)
 
     # ---- host: zones, tables, counts and seed packets (the CPU recipe) ----
-    zones = emission_zones(model; t_emit = t_emit, capture_factor = cf,
+    zones = emission_zones(model; t_emit = t_emit,
                            max_zones = max_zones, stride = stride, r_emit_max = r_emit_max)
     nz = length(zones)
     nz == 0 && error("mc_spectrum_grmhd_gpu: no emitting zones (check cuts / snapshot)")
@@ -1052,7 +1051,7 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
            swE = zf(Float64, nb, nph, n_ebins), lo = _mcb_to(backend, lo), hi = _mcb_to(backend, hi),
            esc = zf(Float64, 1), nrec = zf(Int64, 1), ninvalid = zf(Int64, 1), ncap_steps = zf(Int64, 1),
            stall_E = zf(Float64, 1), nacut = zf(Int64, 1), acut_E = zf(Float64, 1))
-    qbase = (cf = cf, C = Float64(C), R_record = Float64(R_record), Rem = Rem,
+    qbase = (C = Float64(C), R_record = Float64(R_record), Rem = Rem,
              L_unit = model.L_unit, max_steps = Int(max_steps),
              scattering = scattering, max_scatt = Int(max_scatt), bias0 = Float64(bias0),
              theta_e2_mean = te2, bias_K = Float64(bias_K), tau_abs_max = Float64(tau_abs_max),

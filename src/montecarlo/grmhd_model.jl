@@ -213,29 +213,26 @@ _freeze_model(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, t::Real
 
 """
     emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};
-                   t_emit, capture_factor, max_zones=typemax(Int), stride=1,
+                   t_emit, max_zones=typemax(Int), stride=1,
                    r_emit_max=Inf) -> Vector{EmissionZone}
 
 Binary version of `emission_zones`. Emitting cells are placed at the coordinate
 time `t_emit` (the snapshot time), where the orbit, the metric, the fluid
 four-vectors and the proper volume `dV = sqrt(-g) dx1 dx2 dx3 L_unit^3` are
-evaluated. Cells inside either BH's capture boundary
-(`capture_factor * r_plus`, as in binary imaging) are skipped, because their
-photons are captured at once. `r_emit_max` caps the coordinate distance from
-the origin (the binary's centre of mass), since `ks_radius` has no meaning here.
+evaluated. Cells inside either BH's capture boundary (`r_plus`, as in binary
+imaging) are skipped, because their photons are captured at once. `r_emit_max`
+caps the coordinate distance from the origin (the binary's centre of mass),
+since `ks_radius` has no meaning here.
 `stride`, `max_zones` and the finest-block de-duplication are as upstream.
 """
 function emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};
-                        t_emit::Real, capture_factor::Real,
+                        t_emit::Real,
                         max_zones::Integer = typemax(Int),
                         stride::Integer = 1, r_emit_max::Real = Inf)
     snap = model.snap
     st = model.spacetime
     t = Float64(t_emit)
-    cf = Float64(capture_factor)
     isfinite(t) || throw(ArgumentError("t_emit must be finite"))
-    isfinite(cf) && cf >= 1.0 ||
-        throw(ArgumentError("capture_factor must be finite and at least 1"))
     rmax = Float64(r_emit_max)
     zones = EmissionZone[]
     s3 = Float64(stride)^3
@@ -251,7 +248,7 @@ function emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian
             _owner_block(snap, xx, yy, zz) == mb || continue      # finest-block only
             sqrt(xx * xx + yy * yy + zz * zz) <= rmax || continue  # luminous-region cap
             xc = SVector(t, xx, yy, zz)
-            ctl = Geodesics._sbks_trace_geometry(st, xc, cf)
+            ctl = Geodesics._sbks_trace_geometry(st, xc)
             ctl.valid || error("emission_zones: invalid binary geometry at $xc")
             ctl.captured && continue                              # inside a capture boundary
             pl = plasma_at(model, xc)

@@ -283,7 +283,7 @@ end
 """
     _pipeline_setup(cfg::RunConfig, snapshot,
                     st::SuperposedBoostedKerrSchildCartesian;
-                    t_obs, capture_factor, C=80.0,
+                    t_obs, C=80.0,
                     nmax=cfg.max_steps, max_step=Inf,
                     max_coord_step=1.0)
 
@@ -306,7 +306,6 @@ function _pipeline_setup(
     snapshot,
     st::SuperposedBoostedKerrSchildCartesian;
     t_obs::Real,
-    capture_factor::Float64,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
     max_step::Float64=Inf,
@@ -326,7 +325,6 @@ function _pipeline_setup(
         C=C,
         nmax=nmax,
         escape=1.1 * cfg.camera.distance,
-        capture_factor=capture_factor,
         max_step=max_step,
         max_coord_step=max_coord_step,
     )
@@ -357,7 +355,7 @@ end
 """
     render(cfg::RunConfig, snapshot,
            st::SuperposedBoostedKerrSchildCartesian;
-           t_obs, capture_factor, polarized=cfg.polarized,
+           t_obs, polarized=cfg.polarized,
            C=80.0, nmax=cfg.max_steps, max_step=Inf,
            max_coord_step=1.0)
 
@@ -377,7 +375,6 @@ function render(
     snapshot,
     st::SuperposedBoostedKerrSchildCartesian;
     t_obs::Real,
-    capture_factor::Float64,
     polarized::Bool=cfg.polarized,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
@@ -394,7 +391,6 @@ function render(
     setup = _pipeline_setup(
         cfg, snapshot, st;
         t_obs=t_obs,
-        capture_factor=capture_factor,
         C=C,
         nmax=nmax,
         max_step=max_step,

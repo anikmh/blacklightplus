@@ -685,7 +685,7 @@ end
     _sbks_image_kernel!(image, statuses, steps, rays, st,
                         blk, xlft, dxb, lo, hi,
                         ni, nj, nk, nmb, gp,
-                        C, escape, nmax, capture_factor)
+                        C, escape, nmax)
 
 Trace one ray per CUDA thread and accumulate unpolarized intensity
 from the fixed AMR fluid snapshot.
@@ -696,15 +696,15 @@ and weight its emission by the accumulated foreground transmission.
 
 Write intensity, completed step count, and termination status:
 1 = captured, 2 = escaped, 3 = step limit, 4 = invalid calculation.
-Failed rays receive `NaN` intensity. Capture uses approximate individual-BH
-boundaries or the normal-frame photon energy `alpha dt/dlambda` exceeding
+Failed rays receive `NaN` intensity. Capture occurs at either BH's horizon
+or once the normal-frame photon energy `alpha dt/dlambda` exceeds
 `CAPTURE_REDSHIFT`; escape requires outward motion beyond `escape`.
 """
 function _sbks_image_kernel!(
     image, statuses, steps, rays, st,
     blk, xlft, dxb, lo, hi,
     ni, nj, nk, nmb, gp,
-    C, escape, nmax, capture_factor,
+    C, escape, nmax,
 )
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
 
@@ -724,7 +724,7 @@ function _sbks_image_kernel!(
             end
 
             x = SVector(y[1], y[2], y[3], y[4])
-            ctl = G._sbks_trace_geometry(st, x, capture_factor)
+            ctl = G._sbks_trace_geometry(st, x)
 
             if !ctl.valid
                 status = 4
@@ -821,7 +821,7 @@ end
     render_gpu_spacetime(cfg,
                         st::SuperposedBoostedKerrSchildCartesian,
                         snap_or_scangrid;
-                        t_obs, capture_factor, polarized=false,
+                        t_obs, polarized=false,
                         C=80.0, nmax=cfg.max_steps,
                         device=CUDA.deviceid(CUDA.device()),
                         return_status=false)
@@ -833,9 +833,8 @@ Pass a CPU metric containing a `BinaryOrbit` and either an `AthenaKSnapshot`
 or a `DeviceAMRScanGrid` uploaded to `device`. Require numerical tracing;
 polarized rendering is not supported.
 
-`t_obs` sets the camera time. `capture_factor >= 1` sets approximate
-BH capture boundaries, `C` controls distance-based sampling, and `nmax`
-limits steps per ray. Escape occurs on outward motion beyond
+`t_obs` sets the camera time, `C` controls distance-based sampling, and
+`nmax` limits steps per ray. Escape occurs on outward motion beyond
 `1.1 * cfg.camera.distance`. Orbit endpoint extrapolation is allowed.
 
 `cfg.m_bh_cgs` sets the physical primary BH mass. The snapshot's
@@ -852,7 +851,6 @@ function render_gpu_spacetime(
     st::SuperposedBoostedKerrSchildCartesian,
     snap_or_scangrid;
     t_obs::Real,
-    capture_factor::Float64,
     polarized::Bool=false,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
@@ -869,8 +867,6 @@ function render_gpu_spacetime(
         throw(ArgumentError("binary mass ratio must be finite and positive"))
     isfinite(C) && C > 0.0 ||
         throw(ArgumentError("C must be finite and positive"))
-    isfinite(capture_factor) && capture_factor >= 1.0 ||
-        throw(ArgumentError("capture_factor must be finite and at least 1"))
     0 < nmax <= typemax(Int32) ||
         throw(ArgumentError("nmax must fit in a positive Int32"))
     cfg.camera.resolution > 0 ||
@@ -926,7 +922,7 @@ function render_gpu_spacetime(
         sg.dev_lo[dev],
         sg.dev_hi[dev],
         sg.ni, sg.nj, sg.nk, sg.nmb,
-        gp, C, escape, nmax, capture_factor,
+        gp, C, escape, nmax,
     )
     CUDA.synchronize()
 

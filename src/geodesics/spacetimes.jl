@@ -503,7 +503,7 @@ end
 
 """
     _sbks_trace_geometry(st::SuperposedBoostedKerrSchildCartesian,
-                         x::SVector{4,Float64}, capture_factor::Float64)
+                         x::SVector{4,Float64})
 
 Return `(valid, captured, dmin, R)` at coordinate four-vector `x`,
 evaluating both BHs at time `x[1]`.
@@ -512,15 +512,12 @@ evaluating both BHs at time `x[1]`.
 difference between a BH-rest-frame Kerr-Schild radius and its individual
 Kerr horizon radius.
 
-Capture occurs if either radius is at most
-`capture_factor * r_plus + HORIZON_EPS_SAMPLED`. This is an approximate
-absorbing boundary; the capture factor does not change `dmin`.
+Capture occurs if either radius is at most `r_plus + HORIZON_EPS_SAMPLED`.
 Invalid geometry returns `valid=false`.
 """
 @inline function _sbks_trace_geometry(
     st::SuperposedBoostedKerrSchildCartesian,
     x::SVector{4,Float64},
-    capture_factor::Float64,
 )
     position = SVector(x[2], x[3], x[4])
     orb = st.orbit(x[1])
@@ -553,9 +550,7 @@ Invalid geometry returns `valid=false`.
         end
 
         rh = mass + sqrt(mass * mass - a2)
-        captured |= r <= capture_factor * rh + HORIZON_EPS_SAMPLED
-
-        # Step control remains independent of the capture enlargement.
+        captured |= r <= rh + HORIZON_EPS_SAMPLED
         dmin = min(dmin, r - rh)
     end
 
@@ -565,7 +560,7 @@ end
 
 """
     trace_rays_sampled(st::SuperposedBoostedKerrSchildCartesian, rays;
-                       capture_factor, C=80.0, escape=ESCAPE_RADIUS,
+                       C=80.0, escape=ESCAPE_RADIUS,
                        nmax=20000, R_em=Inf, max_step=Inf,
                        max_coord_step=1.0, cell_size_fn=nothing,
                        cell_frac=1.0, return_status=false)
@@ -574,9 +569,8 @@ Trace rays through the time-dependent binary metric using threaded CPU
 RK4 integration. Input states contain (t, x, y, z) and future-directed
 covariant photon momentum. Negative affine steps trace toward the source.
 
-`capture_factor >= 1` sets approximate moving-BH capture boundaries;
-a ray is also captured once its normal-frame photon energy
-`alpha dt/dlambda` exceeds `CAPTURE_REDSHIFT`.
+A ray is captured at either BH's horizon or once its normal-frame
+photon energy `alpha dt/dlambda` exceeds `CAPTURE_REDSHIFT`.
 `C` controls distance-based sampling; `max_step` caps the affine step,
 and `max_coord_step` limits the estimated coordinate displacement.
 An optional `cell_size_fn(x)` further limits the estimated spatial
@@ -597,7 +591,6 @@ Orbit time-range checks depend on the supplied orbit callable.
 function trace_rays_sampled(
     st::SuperposedBoostedKerrSchildCartesian,
     rays::Vector{SVector{8,Float64}};
-    capture_factor::Float64,
     C::Float64=80.0,
     escape::Float64=ESCAPE_RADIUS,
     nmax::Int=20000,
@@ -610,8 +603,6 @@ function trace_rays_sampled(
 )
     isfinite(C) && C > 0.0 ||
         throw(ArgumentError("C must be finite and positive"))
-    isfinite(capture_factor) && capture_factor >= 1.0 ||
-        throw(ArgumentError("capture_factor must be finite and at least 1"))
     nmax > 0 || throw(ArgumentError("nmax must be positive"))
     escape > 0.0 || throw(ArgumentError("escape must be positive"))
     R_em > 0.0 || throw(ArgumentError("R_em must be positive"))
@@ -641,7 +632,7 @@ function trace_rays_sampled(
             all(isfinite, y) || error("ray $i: nonfinite state")
 
             x = SVector(y[1], y[2], y[3], y[4])
-            ctl = _sbks_trace_geometry(st, x, capture_factor)
+            ctl = _sbks_trace_geometry(st, x)
             ctl.valid ||
                 error("ray $i: invalid binary geometry at t=$(x[1])")
 
