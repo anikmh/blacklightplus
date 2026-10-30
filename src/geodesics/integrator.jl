@@ -16,6 +16,9 @@ const ESCAPE_RADIUS = 1.1e3       # default escape sphere; ADMGridSpacetime over
 const HORIZON_EPS = 1e-4          # adaptive Kerr horizon offset: terminate at ks_radius = r_h + this
 const HORIZON_EPS_SAMPLED = 1e-3  # fixed-control sampler + binary capture — looser than HORIZON_EPS for
                                   # the coarse steps; gpu_tracer.jl hard-codes the same 1e-3, keep in sync
+const CAPTURE_REDSHIFT = 1.0e2    # binary capture: normal-frame photon energy E_n = α dx^t/dλ (1 at the
+                                  # camera) above which a backward ray is captured; it grows without bound
+                                  # on a ray that approaches a horizon displaced above r_+ by the companion
 
 "Null constraint g^{μν} p_μ p_ν (≡ 0 on exact null geodesics; error diagnostic)."
 @inline function null_error(st, y::SVector{8})

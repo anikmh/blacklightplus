@@ -16,7 +16,8 @@ using Adapt
 using LinearAlgebra: dot, norm
 using BlackLightPlus: SuperposedKerrSchild, PlaneParallelCamera, camera_rays
 using BlackLightPlus.Geodesics: metric, inverse_metric, geodesic_rhs, rk4_step_fixed,
-      ks_radius_hole, horizon_radius_hole, HORIZON_EPS_SAMPLED, ADMGridSpacetime,
+      ks_radius_hole, horizon_radius_hole, HORIZON_EPS_SAMPLED, CAPTURE_REDSHIFT,
+      ADMGridSpacetime,
       StationarySpacetime, _adm_gcov
 using BlackLightPlus.Geodesics: BinaryOrbit, SuperposedBoostedKerrSchildCartesian
 using BlackLightPlus.Simulation: AthenaKSnapshot
@@ -696,7 +697,8 @@ and weight its emission by the accumulated foreground transmission.
 Write intensity, completed step count, and termination status:
 1 = captured, 2 = escaped, 3 = step limit, 4 = invalid calculation.
 Failed rays receive `NaN` intensity. Capture uses approximate individual-BH
-boundaries; escape requires outward motion beyond `escape`.
+boundaries or the normal-frame photon energy `alpha dt/dlambda` exceeding
+`CAPTURE_REDSHIFT`; escape requires outward motion beyond `escape`.
 """
 function _sbks_image_kernel!(
     image, statuses, steps, rays, st,
@@ -744,6 +746,16 @@ function _sbks_image_kernel!(
                 break
             end
 
+            # Capture on the normal-frame energy alpha dt/dlambda.
+            gcon = G.inverse_metric(st, x)
+            if !all(isfinite, gcon) || gcon[1, 1] >= 0.0
+                status = 4
+                break
+            elseif rhs[1] > CAPTURE_REDSHIFT * sqrt(-gcon[1, 1])
+                status = 1
+                break
+            end
+
             spatial_rate = norm(SVector(rhs[2], rhs[3], rhs[4]))
             rate = max(abs(rhs[1]), spatial_rate)
             h = min(ctl.dmin / C, 1.0) / rate
@@ -770,7 +782,6 @@ function _sbks_image_kernel!(
 
                 kcov = SVector(y[5], y[6], y[7], y[8])
                 gcov = G.metric(st, x)
-                gcon = G.inverse_metric(st, x)
 
                 j_inv, a_inv = _gimg_coeffs_st(
                     prim, kcov, gcov, gcon, gp,

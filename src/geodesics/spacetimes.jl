@@ -574,7 +574,9 @@ Trace rays through the time-dependent binary metric using threaded CPU
 RK4 integration. Input states contain (t, x, y, z) and future-directed
 covariant photon momentum. Negative affine steps trace toward the source.
 
-`capture_factor >= 1` sets approximate moving-BH capture boundaries.
+`capture_factor >= 1` sets approximate moving-BH capture boundaries;
+a ray is also captured once its normal-frame photon energy
+`alpha dt/dlambda` exceeds `CAPTURE_REDSHIFT`.
 `C` controls distance-based sampling; `max_step` caps the affine step,
 and `max_coord_step` limits the estimated coordinate displacement.
 An optional `cell_size_fn(x)` further limits the estimated spatial
@@ -668,6 +670,15 @@ function trace_rays_sampled(
                 error("ray $i: nonfinite geodesic derivative")
             rhs[1] > 0.0 ||
                 error("ray $i: photon does not have positive dt/dlambda")
+
+            # Capture on the normal-frame energy alpha dt/dlambda.
+            gtt = inverse_metric(st, x)[1, 1]
+            gtt < 0.0 ||
+                error("ray $i: no normal observer (g^tt >= 0) at t=$(x[1])")
+            if rhs[1] > CAPTURE_REDSHIFT * sqrt(-gtt)
+                status[i] = :captured
+                break
+            end
 
             spatial_rate = norm(SVector(rhs[2], rhs[3], rhs[4]))
             rate = max(abs(rhs[1]), spatial_rate)
