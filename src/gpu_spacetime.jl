@@ -821,20 +821,22 @@ end
     render_gpu_spacetime(cfg,
                         st::SuperposedBoostedKerrSchildCartesian,
                         snap_or_scangrid;
-                        t_obs, polarized=false,
+                        t_obs, t_snap, polarized=false,
                         C=80.0, nmax=cfg.max_steps,
                         device=CUDA.deviceid(CUDA.device()),
                         return_status=false)
 
-Render unpolarized radiation through the time-dependent binary metric
-on one CUDA device. The fluid snapshot stays fixed along each ray.
+Render unpolarized radiation through the binary metric held at the
+snapshot time `t_snap` (fast light: the fluid snapshot with the BH
+positions it was evolved with), on one CUDA device.
 
 Pass a CPU metric containing a `BinaryOrbit` and either an `AthenaKSnapshot`
 or a `DeviceAMRScanGrid` uploaded to `device`. Require numerical tracing;
 polarized rendering is not supported.
 
-`t_obs` sets the camera time, `C` controls distance-based sampling, and
-`nmax` limits steps per ray. Escape occurs on outward motion beyond
+`t_obs` sets the camera time and `t_snap` the time at which the metric
+is held; `C` controls distance-based sampling, and `nmax` limits steps
+per ray. Escape occurs on outward motion beyond
 `1.1 * cfg.camera.distance`. Orbit endpoint extrapolation is allowed.
 
 `cfg.m_bh_cgs` sets the physical primary BH mass. The snapshot's
@@ -851,6 +853,7 @@ function render_gpu_spacetime(
     st::SuperposedBoostedKerrSchildCartesian,
     snap_or_scangrid;
     t_obs::Real,
+    t_snap::Real,
     polarized::Bool=false,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
@@ -874,13 +877,16 @@ function render_gpu_spacetime(
     isfinite(cfg.camera.distance) && cfg.camera.distance > 0.0 ||
         throw(ArgumentError("camera distance must be finite and positive"))
 
+    isfinite(t_snap) || throw(ArgumentError("t_snap must be finite"))
+    frozen = BlackLightPlus.Geodesics._freeze_spacetime(st, t_snap)   # fast light: metric held at t_snap
+
     cam = PlaneParallelCamera(
         cfg.camera.inclination_deg,
         cfg.camera.distance,
         cfg.camera.fov,
         cfg.camera.resolution,
     )
-    rays = camera_rays(st, cam; t_obs=t_obs)
+    rays = camera_rays(frozen, cam; t_obs=t_obs)
 
     dev = Int(device)
     CUDA.device!(dev)
@@ -899,11 +905,11 @@ function render_gpu_spacetime(
         throw(ArgumentError("pass an AthenaKSnapshot or DeviceAMRScanGrid"))
     end
 
-    orb = st.orbit
+    orb = frozen.orbit
     orb_gpu = DevBinaryOrbit(
         orb.q, CuArray(orb.times), CuArray(orb.data), orb.dt,
     )
-    st_gpu = SuperposedBoostedKerrSchildCartesian(st.q, orb_gpu)
+    st_gpu = SuperposedBoostedKerrSchildCartesian(frozen.q, orb_gpu)
 
     nrays = length(rays)
     rays_gpu = CuArray(rays)

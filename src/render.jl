@@ -283,7 +283,7 @@ end
 """
     _pipeline_setup(cfg::RunConfig, snapshot,
                     st::SuperposedBoostedKerrSchildCartesian;
-                    t_obs, C=80.0,
+                    t_obs, t_snap, C=80.0,
                     nmax=cfg.max_steps, max_step=Inf,
                     max_coord_step=1.0)
 
@@ -291,7 +291,8 @@ Prepare the camera, sampled rays, physical units, and fluid sampler
 for CPU binary rendering. Accept a loaded `AthenaKSnapshot` or a path
 supported by `_load_athenak`.
 
-The metric evolves along each ray while the fluid snapshot stays fixed.
+The metric is held at the snapshot time `t_snap` (fast light: the fluid
+snapshot with the BH positions it was evolved with).
 The snapshot's internal-energy conversion must match `cfg.plasma.gamma`;
 `cfg.m_bh_cgs` sets the physical primary BH mass.
 
@@ -306,11 +307,14 @@ function _pipeline_setup(
     snapshot,
     st::SuperposedBoostedKerrSchildCartesian;
     t_obs::Real,
+    t_snap::Real,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
     max_step::Float64=Inf,
     max_coord_step::Float64=1.0,
 )
+    isfinite(t_snap) || throw(ArgumentError("t_snap must be finite"))
+    frozen = Geodesics._freeze_spacetime(st, t_snap)   # fast light: metric held at t_snap
 
     cam = PlaneParallelCamera(
         cfg.camera.inclination_deg,
@@ -319,9 +323,9 @@ function _pipeline_setup(
         cfg.camera.resolution,
     )
 
-    rays = camera_rays(st, cam; t_obs=t_obs)
+    rays = camera_rays(frozen, cam; t_obs=t_obs)
     states, dls = trace_rays_sampled(
-        st, rays;
+        frozen, rays;
         C=C,
         nmax=nmax,
         escape=1.1 * cfg.camera.distance,
@@ -347,7 +351,7 @@ function _pipeline_setup(
     end
 
     return (
-        st=st, cam=cam, rays=rays, states=states,
+        st=frozen, cam=cam, rays=rays, states=states,
         dls=dls, u=u, sampler=sampler,
     )
 end
@@ -355,12 +359,12 @@ end
 """
     render(cfg::RunConfig, snapshot,
            st::SuperposedBoostedKerrSchildCartesian;
-           t_obs, polarized=cfg.polarized,
+           t_obs, t_snap, polarized=cfg.polarized,
            C=80.0, nmax=cfg.max_steps, max_step=Inf,
            max_coord_step=1.0)
 
 Render unpolarized radiation from a fixed fluid snapshot through the
-time-dependent binary metric on CPU threads.
+binary metric held at the snapshot time `t_snap`, on CPU threads.
 
 Require `cfg.tracer == :numerical` and `polarized == false`.
 Use `_pipeline_setup` to prepare trajectories, then integrate radiation
@@ -375,6 +379,7 @@ function render(
     snapshot,
     st::SuperposedBoostedKerrSchildCartesian;
     t_obs::Real,
+    t_snap::Real,
     polarized::Bool=cfg.polarized,
     C::Float64=80.0,
     nmax::Int=cfg.max_steps,
@@ -391,12 +396,14 @@ function render(
     setup = _pipeline_setup(
         cfg, snapshot, st;
         t_obs=t_obs,
+        t_snap=t_snap,
         C=C,
         nmax=nmax,
         max_step=max_step,
         max_coord_step=max_coord_step,
     )
     (; cam, rays, states, dls, u, sampler) = setup
+    frozen = setup.st
     scc = _prepared_scc(cfg, u)
 
     n = length(rays)
@@ -406,7 +413,7 @@ function render(
 
     Threads.@threads for i in 1:n
         intensities[i] = unpolarized_march(
-            st, scc, sampler, states[i], dls[i], ν, Lu,
+            frozen, scc, sampler, states[i], dls[i], ν, Lu,
         )
     end
 

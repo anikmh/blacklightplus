@@ -205,6 +205,17 @@ SuperposedBoostedKerrSchildCartesian(q::Real, orbit) =
         Float64(q), orbit
     )
 
+"""
+    _freeze_spacetime(st::SuperposedBoostedKerrSchildCartesian, t)
+        -> SuperposedBoostedKerrSchildCartesian
+
+Return the binary metric held at simulation coordinate time `t`: the
+orbit is replaced by `_freeze_orbit(st.orbit, t)`, so the BHs keep the
+positions, velocities, and spins of `st.orbit(t)` at every time.
+"""
+_freeze_spacetime(st::SuperposedBoostedKerrSchildCartesian, t::Real) =
+    SuperposedBoostedKerrSchildCartesian(st.q, _freeze_orbit(st.orbit, t))
+
 # Numerical prescriptions used in the Athena++ implementation.
 const _SBKS_SMALL = 1.0e-7
 const _SBKS_DELTA = 1.0e-4
