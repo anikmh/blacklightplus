@@ -523,7 +523,8 @@ evaluating both BHs at time `x[1]`.
 difference between a BH-rest-frame Kerr-Schild radius and its individual
 Kerr horizon radius.
 
-Capture occurs if either radius is at most `r_plus + HORIZON_EPS_SAMPLED`.
+Capture occurs if either radius is at most
+`CAPTURE_FACTOR * r_plus + HORIZON_EPS_SAMPLED`.
 Invalid geometry returns `valid=false`.
 """
 @inline function _sbks_trace_geometry(
@@ -561,7 +562,7 @@ Invalid geometry returns `valid=false`.
         end
 
         rh = mass + sqrt(mass * mass - a2)
-        captured |= r <= rh + HORIZON_EPS_SAMPLED
+        captured |= r <= CAPTURE_FACTOR * rh + HORIZON_EPS_SAMPLED
         dmin = min(dmin, r - rh)
     end
 
@@ -580,8 +581,8 @@ Trace rays through the time-dependent binary metric using threaded CPU
 RK4 integration. Input states contain (t, x, y, z) and future-directed
 covariant photon momentum. Negative affine steps trace toward the source.
 
-A ray is captured at either BH's horizon or once its normal-frame
-photon energy `alpha dt/dlambda` exceeds `CAPTURE_REDSHIFT`.
+A ray is captured within `CAPTURE_FACTOR * r_plus` of either BH or once
+its normal-frame photon energy `alpha dt/dlambda` exceeds `CAPTURE_REDSHIFT`.
 `C` controls distance-based sampling; `max_step` caps the affine step,
 and `max_coord_step` limits the estimated coordinate displacement.
 An optional `cell_size_fn(x)` further limits the estimated spatial

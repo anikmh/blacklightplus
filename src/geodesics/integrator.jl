@@ -19,6 +19,8 @@ const HORIZON_EPS_SAMPLED = 1e-3  # fixed-control sampler + binary capture — l
 const CAPTURE_REDSHIFT = 1.0e2    # binary capture: normal-frame photon energy E_n = α dx^t/dλ (1 at the
                                   # camera) above which a backward ray is captured; it grows without bound
                                   # on a ray that approaches a horizon displaced above r_+ by the companion
+const CAPTURE_FACTOR = 1.05       # binary capture radius in units of each BH's r_+: the companion displaces
+                                  # each horizon outward (≈ 1.04 r_+), and light from inside it cannot escape
 
 "Null constraint g^{μν} p_μ p_ν (≡ 0 on exact null geodesics; error diagnostic)."
 @inline function null_error(st, y::SVector{8})

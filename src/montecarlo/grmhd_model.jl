@@ -219,10 +219,10 @@ _freeze_model(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, t::Real
 Binary version of `emission_zones`. Emitting cells are placed at the coordinate
 time `t_emit` (the snapshot time), where the orbit, the metric, the fluid
 four-vectors and the proper volume `dV = sqrt(-g) dx1 dx2 dx3 L_unit^3` are
-evaluated. Cells inside either BH's capture boundary (`r_plus`, as in binary
-imaging) are skipped, because their photons are captured at once. `r_emit_max`
-caps the coordinate distance from the origin (the binary's centre of mass),
-since `ks_radius` has no meaning here.
+evaluated. Cells inside either BH's capture boundary (`CAPTURE_FACTOR * r_plus`,
+as in binary imaging) are skipped, because their photons are captured at once.
+`r_emit_max` caps the coordinate distance from the origin (the binary's centre
+of mass), since `ks_radius` has no meaning here.
 `stride`, `max_zones` and the finest-block de-duplication are as upstream.
 """
 function emission_zones(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian};

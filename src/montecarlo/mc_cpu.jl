@@ -472,7 +472,7 @@ end
 # null geodesic, trapezoid absorption depth, biased Compton trigger), with the
 # geometry of the time-dependent binary metric taken from binary imaging
 # (`trace_rays_sampled` for `SuperposedBoostedKerrSchildCartesian`, spacetimes.jl):
-#   - capture at either moving BH: rest-frame KS radius <= r_plus
+#   - capture at either moving BH: rest-frame KS radius <= CAPTURE_FACTOR * r_plus
 #     (+ HORIZON_EPS_SAMPLED), via `Geodesics._sbks_trace_geometry`;
 #   - step: coordinate displacement ~ min(d_min / C, 1) with d_min the smallest
 #     distance to an individual horizon, h = that / max(|dt/dl|, |dx/dl|);
@@ -515,7 +515,7 @@ end
 Binary version of `track_superphoton_grmhd` (absorption only): the same march,
 forward in time through the binary metric. `recorded = true` on reaching
 `R_record` or streaming outbound past `Rem`; `false` on capture at either BH
-(`r_plus`, as in binary imaging) or after `max_steps` steps,
+(`CAPTURE_FACTOR * r_plus`, as in binary imaging) or after `max_steps` steps,
 which also sets `stalled = true`.
 """
 function track_superphoton_grmhd(sph::Superphoton,

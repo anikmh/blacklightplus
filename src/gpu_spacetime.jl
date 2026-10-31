@@ -696,8 +696,9 @@ and weight its emission by the accumulated foreground transmission.
 
 Write intensity, completed step count, and termination status:
 1 = captured, 2 = escaped, 3 = step limit, 4 = invalid calculation.
-Failed rays receive `NaN` intensity. Capture occurs at either BH's horizon
-or once the normal-frame photon energy `alpha dt/dlambda` exceeds
+Failed rays receive `NaN` intensity. Capture occurs within
+`CAPTURE_FACTOR * r_plus` of either BH or once the normal-frame photon
+energy `alpha dt/dlambda` exceeds
 `CAPTURE_REDSHIFT`; escape requires outward motion beyond `escape`.
 """
 function _sbks_image_kernel!(
