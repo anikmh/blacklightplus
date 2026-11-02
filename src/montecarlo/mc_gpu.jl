@@ -1115,5 +1115,6 @@ function mc_spectrum_grmhd_gpu(model::GRMHDModel{<:SuperposedBoostedKerrSchildCa
                                      Int(max_steps), Int(Array(acc.ncap_steps)[1]),
                                      mec2 * Array(acc.stall_E)[1],
                                      te2, Float64(bias_K), Float64(tau_abs_max),
-                                     Int(Array(acc.nacut)[1]), mec2 * Array(acc.acut_E)[1])
+                                     Int(Array(acc.nacut)[1]), mec2 * Array(acc.acut_E)[1],
+                                     NaN, NaN, NaN, NaN, NaN)         # energy budget: CPU only
 end

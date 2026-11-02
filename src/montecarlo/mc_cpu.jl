@@ -509,19 +509,21 @@ end
 
 """
     track_superphoton_grmhd(sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
-                            C, R_record, Rem; max_steps=_GRMHD_MAX_STEPS)
+                            C, R_record, Rem; max_steps=_GRMHD_MAX_STEPS, tally=nothing)
         -> (Superphoton, recorded::Bool, stalled::Bool)
 
 Binary version of `track_superphoton_grmhd` (absorption only): the same march,
 forward in time through the binary metric. `recorded = true` on reaching
 `R_record` or streaming outbound past `Rem`; `false` on capture at either BH
 (`CAPTURE_FACTOR * r_plus`, as in binary imaging) or after `max_steps` steps,
-which also sets `stalled = true`.
+which also sets `stalled = true`. With a `tally` vector, the absorbed `Sum w E`
+is added to `tally[1]`.
 """
 function track_superphoton_grmhd(sph::Superphoton,
                                  model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                  C::Float64, R_record::Float64, Rem::Float64;
-                                 max_steps::Int = _GRMHD_MAX_STEPS)
+                                 max_steps::Int = _GRMHD_MAX_STEPS,
+                                 tally::Union{Nothing,Vector{Float64}} = nothing)
     st = model.spacetime
     x = sph.x
     p = sph.p
@@ -553,6 +555,7 @@ function track_superphoton_grmhd(sph::Superphoton,
         na1 = _grmhd_nu_alpha(pln, pn)
         dtau = 0.5 * (na0 + na1) * Cgr * h
         tau += dtau
+        tally === nothing || (tally[1] -= w * expm1(-dtau) * sph.E)   # absorbed
         w *= exp(-dtau)
         x = xn; p = pn; na0 = na1
     end
@@ -566,7 +569,7 @@ end
     track_superphoton_grmhd_scatter!(ws, sph, model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
                                      table, C, R_record, Rem, bias0, max_scatt, rng;
                                      max_steps=_GRMHD_MAX_STEPS, theta_e2_mean=1.0,
-                                     bias_K=1.0, tau_abs_max=100.0)
+                                     bias_K=1.0, tau_abs_max=100.0, tally=nothing)
         -> (escaped::Superphoton, recorded::Bool, stalled::Bool, rng::MCRng)
 
 Binary version of `track_superphoton_grmhd_scatter!`, on the geometry of the
@@ -574,6 +577,10 @@ binary `track_superphoton_grmhd` and with the bounded bias
 `grmhd_bias(bias0, theta_e, theta_e2_mean, tau_s, bias_K)`. The `s`-th child
 along the path takes the stream `_mc_child_rng(rng, s)`. A packet whose absorption
 depth exceeds `tau_abs_max` is dropped (`recorded = stalled = false`), as in grmonty.
+With a `tally` vector, each step's depletion `w (1 - e^{-(dtau_a + dtau_s)}) E` is split
+in proportion to the two depths: absorbed into `tally[1]`, scattered out into
+`tally[2]`, and the scattered-out part that can spawn no child (`max_scatt` reached
+or the sample outside the grid) also into `tally[3]`.
 """
 function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton,
                                           model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian},
@@ -583,7 +590,8 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
                                           max_steps::Int = _GRMHD_MAX_STEPS,
                                           theta_e2_mean::Float64 = 1.0,
                                           bias_K::Float64 = 1.0,
-                                          tau_abs_max::Float64 = 100.0)
+                                          tau_abs_max::Float64 = 100.0,
+                                          tally::Union{Nothing,Vector{Float64}} = nothing)
     st = model.spacetime
     x = sph.x
     p = sph.p
@@ -648,6 +656,13 @@ function track_superphoton_grmhd_scatter!(ws::ScatterWorkspace, sph::Superphoton
         end
 
         # ---- physical depletion of the incident beam ------------------------
+        if tally !== nothing && dtau_a + dtau_s > 0.0
+            dep = -w * expm1(-(dtau_a + dtau_s)) * sph.E
+            tally[1] += dep * dtau_a / (dtau_a + dtau_s)                 # absorbed
+            sout = dep * dtau_s / (dtau_a + dtau_s)                       # scattered out
+            tally[2] += sout
+            (pln.inside && Int(nscatt) < max_scatt) || (tally[3] += sout) # no child possible
+        end
         w *= exp(-(dtau_a + dtau_s))
         tau_a += dtau_a
         tau_s += dtau_s
@@ -716,6 +731,12 @@ centred on `phi_deg[j]` (sector 1 on +x, the imaging camera's azimuth). Also
 records `t_emit`, the step limit and the packets it stopped (`n_step_limit`,
 `step_limit_power`), the bias normalisation (`theta_e2_mean`, `bias_K`) and the
 packets dropped beyond `tau_abs_max` (`n_abs_cut`, `abs_cut_power`; powers in erg/s).
+Energy budget (erg/s, `Sum w E` with the conserved E): `absorbed_power`,
+`captured_power` (left at capture), `scattered_power` (scattered out of beams),
+`unscattered_power` (its part that spawned no child) and `child_power` (Compton
+children at spawn); `emitted + child = escaped + absorbed + captured + scattered +
+step_limit + abs_cut`, and `child - (scattered - unscattered)` estimates the Compton
+gain. NaN where not tallied (GPU).
 """
 struct GRMHDBinarySpectrumResult
     incl_deg::Vector{Float64}
@@ -739,6 +760,11 @@ struct GRMHDBinarySpectrumResult
     tau_abs_max::Float64
     n_abs_cut::Int
     abs_cut_power::Float64
+    absorbed_power::Float64
+    captured_power::Float64
+    scattered_power::Float64
+    unscattered_power::Float64
+    child_power::Float64
 end
 
 """
@@ -1094,6 +1120,7 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
     estall = zeros(Float64, nchunks)
     nacut = zeros(Int, nchunks)
     eacut = zeros(Float64, nchunks)
+    budget = zeros(Float64, 5, nchunks)          # absorbed, captured, scattered, unscattered, child
 
     _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                     model, zones, wgt, dnmax, lint, offset, Ntot, tbl,
@@ -1101,7 +1128,8 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                     scattering, Int(seed), lo, hi;
                     max_steps = Int(max_steps), nstall = nstall, estall = estall,
                     theta_e2_mean = te2, bias_K = Float64(bias_K),
-                    tau_abs_max = Float64(tau_abs_max), nacut = nacut, eacut = eacut)
+                    tau_abs_max = Float64(tau_abs_max), nacut = nacut, eacut = eacut,
+                    budget = budget)
 
     bands = mkbands()
     total = mkspec()
@@ -1117,7 +1145,8 @@ function mc_spectrum_grmhd(model::GRMHDModel{<:SuperposedBoostedKerrSchildCartes
                                      sum(nrec), scattering, Float64(t_emit),
                                      Int(max_steps), sum(nstall), mec2 * sum(estall),
                                      te2, Float64(bias_K), Float64(tau_abs_max),
-                                     sum(nacut), mec2 * sum(eacut))
+                                     sum(nacut), mec2 * sum(eacut),
+                                     (mec2 .* vec(sum(budget; dims = 2)))...)
 end
 
 # Record an escaped packet into the total and the matching (band, sector)
@@ -1142,13 +1171,14 @@ end
 """
     _mc_grmhd_loop!(..., model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, ...;
                     max_steps, nstall, estall,
-                    theta_e2_mean, bias_K, tau_abs_max, nacut, eacut) -> nothing
+                    theta_e2_mean, bias_K, tau_abs_max, nacut, eacut, budget) -> nothing
 
 Binary version of the threaded kernel: the same chunking, seed streams and
 accumulators, with the binary trackers and recording by band and azimuth sector.
 Children take derived streams (`_mc_child_rng`). Packets stopped by the step
 limit and dropped by the absorption cut are counted per chunk (`nstall`/`estall`,
-`nacut`/`eacut`: number and Sum w E).
+`nacut`/`eacut`: number and Sum w E); `budget[:, c]` takes the chunk's absorbed,
+captured, scattered, unscattered and child `Sum w E` (see `GRMHDBinarySpectrumResult`).
 """
 function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          model::GRMHDModel{<:SuperposedBoostedKerrSchildCartesian}, zones,
@@ -1161,7 +1191,8 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                          max_steps::Int,
                          nstall::Vector{Int}, estall::Vector{Float64},
                          theta_e2_mean::Float64, bias_K::Float64, tau_abs_max::Float64,
-                         nacut::Vector{Int}, eacut::Vector{Float64})
+                         nacut::Vector{Int}, eacut::Vector{Float64},
+                         budget::Matrix{Float64})
     st = model.spacetime
     nchunks = length(total_by_chunk)
     Threads.@threads for c in 1:nchunks
@@ -1175,6 +1206,9 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         e_stall = 0.0
         na = 0
         e_acut = 0.0
+        tl = zeros(Float64, 3)                    # absorbed, scattered, unscattered (trackers)
+        e_capt = 0.0
+        e_child = 0.0
         glo = div((c - 1) * Ntot, nchunks) + 1
         ghi = div(c * Ntot, nchunks)
         @inbounds for gid in glo:ghi
@@ -1188,17 +1222,20 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                 push_photon!(ws, sp, rng)
                 while !isempty(ws.sp)
                     cur, crng = pop_photon!(ws)
+                    cur.nscatt > 0 && (e_child += cur.w * cur.E)    # child at spawn
                     e, recorded, stalled, crng = track_superphoton_grmhd_scatter!(
                         ws, cur, model, table, C, R_record, Rem, bias0, max_scatt, crng;
                         max_steps = max_steps,
                         theta_e2_mean = theta_e2_mean, bias_K = bias_K,
-                        tau_abs_max = tau_abs_max)
+                        tau_abs_max = tau_abs_max, tally = tl)
                     if stalled
                         ns += 1
                         e_stall += e.w * e.E
                     elseif !recorded && e.tau_abs > tau_abs_max
                         na += 1
                         e_acut += e.w * e.E
+                    elseif !recorded
+                        e_capt += e.w * e.E                           # captured
                     end
                     if recorded
                         e_esc += e.w * e.E
@@ -1208,10 +1245,12 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
                 end
             else
                 e, recorded, stalled = track_superphoton_grmhd(sp, model, C, R_record, Rem;
-                                                               max_steps = max_steps)
+                                                               max_steps = max_steps, tally = tl)
                 if stalled
                     ns += 1
                     e_stall += e.w * e.E
+                elseif !recorded
+                    e_capt += e.w * e.E                               # captured
                 end
                 if recorded
                     e_esc += e.w * e.E
@@ -1227,6 +1266,11 @@ function _mc_grmhd_loop!(bands_by_chunk, total_by_chunk, emit, esc, nrec,
         estall[c] = e_stall
         nacut[c] = na
         eacut[c] = e_acut
+        budget[1, c] = tl[1]
+        budget[2, c] = e_capt
+        budget[3, c] = tl[2]
+        budget[4, c] = tl[3]
+        budget[5, c] = e_child
     end
     return nothing
 end
